@@ -1,0 +1,1589 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, HashSet},
+    io::{BufRead, BufReader},
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    sync::{mpsc, Arc, Mutex},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use uuid::Uuid;
+
+// Shared registry of running child PIDs — read by the signal handler to kill
+// all children before the process exits (e.g. on Ctrl+C or SIGTERM).
+type PidRegistry = Arc<Mutex<Vec<u32>>>;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Palette
+// ══════════════════════════════════════════════════════════════════════════════
+
+const BG_BASE:    Color32 = Color32::from_rgb(  9,  12,  18);
+const BG_PANEL:   Color32 = Color32::from_rgb( 14,  20,  32);
+const BG_CARD:    Color32 = Color32::from_rgb( 22,  30,  46);
+const BG_RAISED:  Color32 = Color32::from_rgb( 18,  25,  38);
+const BG_INPUT:   Color32 = Color32::from_rgb( 10,  15,  24);
+const BG_HOVER:   Color32 = Color32::from_rgb( 26,  40,  64);
+const BG_SEL:     Color32 = Color32::from_rgb( 18,  32,  68);
+
+const BORDER:     Color32 = Color32::from_rgb( 28,  42,  62);
+const BORDER_HI:  Color32 = Color32::from_rgb( 46,  64,  96);
+
+const TEXT_PRI:   Color32 = Color32::from_rgb(220, 232, 245);
+const TEXT_SEC:   Color32 = Color32::from_rgb(122, 155, 191);
+const TEXT_MUTED: Color32 = Color32::from_rgb( 61,  85, 112);
+const TEXT_DIM:   Color32 = Color32::from_rgb( 35,  52,  72);
+
+const GREEN:      Color32 = Color32::from_rgb( 33, 212, 126);
+const GREEN_DIM:  Color32 = Color32::from_rgb( 14,  74,  44);
+const GREEN_BG:   Color32 = Color32::from_rgb(  7,  28,  18);
+const RED:        Color32 = Color32::from_rgb(240,  74,  94);
+const RED_DIM:    Color32 = Color32::from_rgb( 74,  15,  22);
+const RED_BG:     Color32 = Color32::from_rgb( 30,   6,  10);
+const AMBER:      Color32 = Color32::from_rgb(240, 160,  48);
+const BLUE:       Color32 = Color32::from_rgb( 68, 136, 255);
+const BLUE_DIM:   Color32 = Color32::from_rgb( 18,  32, 100);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Config — lives in the .json file the user passes
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EnvVar {
+    pub key:   String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Component {
+    pub id:           String,
+    pub name:         String,
+    #[serde(default)] pub executable:  String,
+    #[serde(default)] pub working_dir: String,
+    #[serde(default)] pub args:        String,
+    #[serde(default)] pub log_path:    String,
+    #[serde(default)] pub run_as_user: String,
+    #[serde(default)] pub env_vars:    Vec<EnvVar>,
+}
+
+impl Component {
+    fn new() -> Self {
+        Self {
+            id:           Uuid::new_v4().to_string(),
+            name:         String::new(),
+            executable:   String::new(),
+            working_dir:  String::new(),
+            args:         String::new(),
+            log_path:     String::new(),
+            run_as_user:  String::new(),
+            env_vars:     vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    pub id:         String,
+    pub name:       String,
+    #[serde(default)] pub components: Vec<Component>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppConfig {
+    #[serde(default)] pub groups: Vec<Group>,
+}
+
+fn load_config(path: &PathBuf) -> AppConfig {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(config: &AppConfig, path: &PathBuf) {
+    if let Some(p) = path.parent() { let _ = std::fs::create_dir_all(p); }
+    if let Ok(s) = serde_json::to_string_pretty(config) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Runtime types
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Source { Stdout, Stderr, System }
+
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    pub time:   String,
+    pub source: Source,
+    pub text:   String,
+}
+
+pub enum AppEvent {
+    Log    { id: String, line: LogLine },
+    Status { id: String, running: bool, pid: Option<u32>, exit_code: Option<i32> },
+}
+
+struct RunningProcess {
+    pid:        u32,
+    started_at: Instant,
+    child:      Arc<Mutex<Child>>,
+}
+
+fn now_hms() -> String {
+    let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    format!("{:02}:{:02}:{:02}", (s % 86400) / 3600, (s % 3600) / 60, s % 60)
+}
+
+fn format_uptime(started: Instant) -> String {
+    let e = started.elapsed().as_secs();
+    if e < 60   { return format!("{}s", e); }
+    if e < 3600 { return format!("{}m {}s", e / 60, e % 60); }
+    format!("{}h {}m", e / 3600, (e % 3600) / 60)
+}
+
+fn split_args(s: &str) -> Vec<String> {
+    let mut args = vec![];
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for ch in s.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => cur.push(ch),
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                ' ' | '\t' => { if !cur.is_empty() { args.push(cur.drain(..).collect()); } }
+                _ => cur.push(ch),
+            },
+        }
+    }
+    if !cur.is_empty() { args.push(cur); }
+    args
+}
+
+/// Resolve a path from the config: if relative, anchor it to the config file's
+/// directory so the whole project folder is portable.
+fn resolve_path(raw: &str, base_dir: &PathBuf) -> PathBuf {
+    let p = PathBuf::from(raw);
+    if p.is_absolute() { p } else { base_dir.join(p) }
+}
+
+fn resolve_log_path(raw: &str, comp_name: &str, base_dir: &PathBuf) -> Option<PathBuf> {
+    if raw.is_empty() { return None; }
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let days = (secs / 86400) as u32;
+    let date = days_to_ymd(days);
+    let expanded = raw.replace("{name}", comp_name).replace("{date}", &date);
+    Some(resolve_path(&expanded, base_dir))
+}
+
+fn days_to_ymd(days: u32) -> String {
+    let jd = days + 2440588;
+    let l  = jd + 68569;
+    let n  = 4 * l / 146097;
+    let l  = l - (146097 * n + 3) / 4;
+    let i  = 4000 * (l + 1) / 1461001;
+    let l  = l - 1461 * i / 4 + 31;
+    let j  = 80 * l / 2447;
+    let d  = l - 2447 * j / 80;
+    let l  = j / 11;
+    let mo = j + 2 - 12 * l;
+    let y  = 100 * (n - 49) + i + l;
+    format!("{:04}-{:02}-{:02}", y, mo, d)
+}
+
+#[cfg(unix)]
+fn kill_tree(pid: u32) {
+    // Kill the whole process group
+    libc_kill(-(pid as i32), 15);
+}
+#[cfg(unix)]
+extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
+#[cfg(unix)]
+fn libc_kill(pid: i32, sig: i32) { unsafe { kill(pid, sig); } }
+
+#[cfg(windows)]
+fn kill_tree(pid: u32) {
+    let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn kill_tree(pid: u32) { let _ = pid; }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// UI state helpers
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[derive(PartialEq, Clone)]
+enum MainView { Dashboard, Log, Edit }
+
+#[derive(Clone)]
+struct EditState {
+    component:  Component,
+    group_id:   String,
+    is_new:     bool,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// App
+// ══════════════════════════════════════════════════════════════════════════════
+
+struct ProConductor {
+    // Persistent
+    config:      AppConfig,
+    config_path: PathBuf,
+    dirty:       bool,
+    // Held for entire lifetime — OS releases exclusive lock on drop (incl. crash)
+    _lock:       std::fs::File,
+    // Shared with signal handler — all running child PIDs
+    pid_registry: PidRegistry,
+
+    // Runtime
+    running:    HashMap<String, RunningProcess>,
+    logs:       HashMap<String, Vec<LogLine>>,
+    event_tx:   mpsc::Sender<AppEvent>,
+    event_rx:   mpsc::Receiver<AppEvent>,
+    ctx_handle: egui::Context,
+
+    // UI
+    selected_comp:  Option<String>,
+    selected_group: Option<String>,
+    view:           MainView,
+    edit:           Option<EditState>,
+    open_groups:    HashSet<String>,
+    log_filter:     String,
+    log_autoscroll: bool,
+    confirm_delete: Option<(String, String)>, // (kind, id)
+}
+
+impl ProConductor {
+    fn new(cc: &eframe::CreationContext, config: AppConfig, path: PathBuf, lock: std::fs::File, pid_registry: PidRegistry) -> Self {
+        // Apply dark theme with our custom palette
+        let mut visuals = egui::Visuals::dark();
+        visuals.window_fill              = BG_BASE;
+        visuals.panel_fill               = BG_PANEL;
+        visuals.faint_bg_color           = BG_CARD;
+        visuals.extreme_bg_color         = BG_INPUT;
+        visuals.widgets.noninteractive.bg_fill  = BG_CARD;
+        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_MUTED);
+        visuals.widgets.inactive.bg_fill        = BG_CARD;
+        visuals.widgets.inactive.fg_stroke      = Stroke::new(1.0, TEXT_SEC);
+        visuals.widgets.hovered.bg_fill         = BG_HOVER;
+        visuals.widgets.hovered.fg_stroke       = Stroke::new(1.0, TEXT_PRI);
+        visuals.widgets.active.bg_fill          = BG_SEL;
+        visuals.widgets.active.fg_stroke        = Stroke::new(1.0, TEXT_PRI);
+        visuals.selection.bg_fill               = BLUE_DIM;
+        visuals.selection.stroke                = Stroke::new(1.0, BLUE);
+        visuals.override_text_color             = Some(TEXT_PRI);
+        cc.egui_ctx.set_visuals(visuals);
+
+        // Slightly larger default font
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.text_styles.insert(
+            egui::TextStyle::Body,
+            FontId::new(13.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Small,
+            FontId::new(11.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Monospace,
+            FontId::new(11.5, egui::FontFamily::Monospace),
+        );
+        style.spacing.item_spacing    = Vec2::new(6.0, 4.0);
+        style.spacing.button_padding  = Vec2::new(8.0, 4.0);
+        style.spacing.window_margin   = egui::Margin::same(0.0);
+        cc.egui_ctx.set_style(style);
+
+        let (tx, rx) = mpsc::channel();
+
+        // Open all groups initially
+        let open_groups = config.groups.iter().map(|g| g.id.clone()).collect();
+
+        Self {
+            config,
+            config_path: path,
+            dirty: false,
+            _lock: lock,
+            pid_registry,
+            running: HashMap::new(),
+            logs: HashMap::new(),
+            event_tx: tx,
+            event_rx: rx,
+            ctx_handle: cc.egui_ctx.clone(),
+            selected_comp: None,
+            selected_group: None,
+            view: MainView::Dashboard,
+            edit: None,
+            open_groups,
+            log_filter: String::new(),
+            log_autoscroll: true,
+            confirm_delete: None,
+        }
+    }
+
+    // ── Process spawning ───────────────────────────────────────────────────
+
+    fn start(&mut self, comp: &Component) {
+        if self.running.contains_key(&comp.id) { return; }
+
+        let mut args = split_args(&comp.args);
+
+        // sudo -u <user> on Unix
+        let exe = if !comp.run_as_user.is_empty() {
+            #[cfg(unix)] {
+                args.insert(0, comp.executable.clone());
+                args.insert(0, comp.run_as_user.clone());
+                args.insert(0, "-u".into());
+                "sudo".to_string()
+            }
+            #[cfg(not(unix))]
+            { comp.executable.clone() }
+        } else {
+            comp.executable.clone()
+        };
+
+        // Base dir for resolving relative paths = directory containing the config file
+        let base_dir = self.config_path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let mut cmd = Command::new(&exe);
+        cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if !comp.working_dir.is_empty() {
+            cmd.current_dir(resolve_path(&comp.working_dir, &base_dir));
+        }
+        for ev in &comp.env_vars { if !ev.key.is_empty() { cmd.env(&ev.key, &ev.value); } }
+
+        // New process group on Unix for clean tree-kill
+        #[cfg(unix)] { use std::os::unix::process::CommandExt; cmd.process_group(0); }
+
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                self.logs.entry(comp.id.clone()).or_default().push(LogLine {
+                    time: now_hms(), source: Source::System,
+                    text: format!("Failed to start: {}", e),
+                });
+                self.ctx_handle.request_repaint();
+                return;
+            }
+        };
+
+        let pid = child.id();
+        let child_arc = Arc::new(Mutex::new(child));
+
+        // Open log file if configured
+        let log_file: Option<Arc<Mutex<std::fs::File>>> = resolve_log_path(&comp.log_path, &comp.name, &base_dir)
+            .and_then(|p| {
+                if let Some(par) = p.parent() { let _ = std::fs::create_dir_all(par); }
+                std::fs::OpenOptions::new().create(true).append(true).open(&p).ok()
+            })
+            .map(|f| Arc::new(Mutex::new(f)));
+
+        // ── Stdout thread
+        let stdout = child_arc.lock().unwrap().stdout.take().unwrap();
+        let tx_out  = self.event_tx.clone();
+        let id_out  = comp.id.clone();
+        let lf_out  = log_file.clone();
+        let ctx_out = self.ctx_handle.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().flatten() {
+                write_log_file(&lf_out, "OUT", &line);
+                let _ = tx_out.send(AppEvent::Log { id: id_out.clone(), line: LogLine {
+                    time: now_hms(), source: Source::Stdout, text: line,
+                }});
+                ctx_out.request_repaint();
+            }
+        });
+
+        // ── Stderr thread
+        let stderr = child_arc.lock().unwrap().stderr.take().unwrap();
+        let tx_err  = self.event_tx.clone();
+        let id_err  = comp.id.clone();
+        let lf_err  = log_file.clone();
+        let ctx_err = self.ctx_handle.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().flatten() {
+                write_log_file(&lf_err, "ERR", &line);
+                let _ = tx_err.send(AppEvent::Log { id: id_err.clone(), line: LogLine {
+                    time: now_hms(), source: Source::Stderr, text: line,
+                }});
+                ctx_err.request_repaint();
+            }
+        });
+
+        // ── Monitor thread: wait for exit
+        let child_mon = child_arc.clone();
+        let tx_mon    = self.event_tx.clone();
+        let id_mon    = comp.id.clone();
+        let ctx_mon   = self.ctx_handle.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_millis(200));
+                let mut guard = match child_mon.lock() { Ok(g) => g, Err(_) => break };
+                match guard.try_wait() {
+                    Ok(Some(status)) => {
+                        #[cfg(unix)] let code = {
+                            use std::os::unix::process::ExitStatusExt;
+                            status.code().or_else(|| status.signal().map(|s| -(s as i32)))
+                        };
+                        #[cfg(not(unix))] let code = status.code();
+                        let _ = tx_mon.send(AppEvent::Log { id: id_mon.clone(), line: LogLine {
+                            time: now_hms(), source: Source::System,
+                            text: format!("Process exited (code {:?})", code),
+                        }});
+                        let _ = tx_mon.send(AppEvent::Status {
+                            id: id_mon, running: false, pid: None, exit_code: code,
+                        });
+                        ctx_mon.request_repaint();
+                        break;
+                    }
+                    Ok(None) => {} // still running
+                    Err(_)   => break,
+                }
+            }
+        });
+
+        self.running.insert(comp.id.clone(), RunningProcess {
+            pid, started_at: Instant::now(), child: child_arc,
+        });
+        // Register PID so signal handler can kill it on Ctrl+C
+        self.pid_registry.lock().unwrap().push(pid);
+
+        self.logs.entry(comp.id.clone()).or_default().push(LogLine {
+            time: now_hms(), source: Source::System,
+            text: format!("Started PID {}", pid),
+        });
+    }
+
+    fn stop(&mut self, id: &str) {
+        if let Some(handle) = self.running.remove(id) {
+            kill_tree(handle.pid);
+            // child.kill() as fallback
+            if let Ok(mut c) = handle.child.lock() { let _ = c.kill(); }
+            // Unregister from signal handler registry
+            self.pid_registry.lock().unwrap().retain(|&p| p != handle.pid);
+            self.logs.entry(id.to_string()).or_default().push(LogLine {
+                time: now_hms(), source: Source::System, text: "Stop requested".into(),
+            });
+            self.ctx_handle.request_repaint();
+        }
+    }
+
+    fn start_all(&mut self) {
+        let comps: Vec<Component> = self.config.groups.iter()
+            .flat_map(|g| g.components.iter().cloned())
+            .filter(|c| !self.running.contains_key(&c.id))
+            .collect();
+        for c in comps { self.start(&c); }
+    }
+
+    fn stop_all(&mut self) {
+        let ids: Vec<String> = self.running.keys().cloned().collect();
+        for id in ids { self.stop(&id); }
+    }
+
+    fn start_group(&mut self, group_id: &str) {
+        let comps: Vec<Component> = self.config.groups.iter()
+            .find(|g| g.id == group_id)
+            .map(|g| g.components.iter()
+                .filter(|c| !self.running.contains_key(&c.id))
+                .cloned().collect())
+            .unwrap_or_default();
+        for c in comps { self.start(&c); }
+    }
+
+    fn stop_group(&mut self, group_id: &str) {
+        let ids: Vec<String> = self.config.groups.iter()
+            .find(|g| g.id == group_id)
+            .map(|g| g.components.iter()
+                .filter(|c| self.running.contains_key(&c.id))
+                .map(|c| c.id.clone()).collect())
+            .unwrap_or_default();
+        for id in ids { self.stop(&id); }
+    }
+
+    fn group_running_count(&self, group_id: &str) -> (usize, usize) {
+        // returns (running, total)
+        let comps = self.config.groups.iter()
+            .find(|g| g.id == group_id)
+            .map(|g| &g.components[..])
+            .unwrap_or(&[]);
+        let running = comps.iter().filter(|c| self.running.contains_key(&c.id)).count();
+        (running, comps.len())
+    }
+
+    fn drain_events(&mut self) {
+        while let Ok(ev) = self.event_rx.try_recv() {
+            match ev {
+                AppEvent::Log { id, line } => {
+                    let buf = self.logs.entry(id).or_default();
+                    buf.push(line);
+                    if buf.len() > 5000 { buf.drain(..500); }
+                }
+                AppEvent::Status { id, running, .. } => {
+                    if !running { self.running.remove(&id); }
+                }
+            }
+        }
+    }
+
+    // ── Counts ────────────────────────────────────────────────────────────
+    fn running_count(&self) -> usize { self.running.len() }
+    fn total_count(&self)   -> usize {
+        self.config.groups.iter().map(|g| g.components.len()).sum()
+    }
+}
+
+fn write_log_file(f: &Option<Arc<Mutex<std::fs::File>>>, src: &str, text: &str) {
+    use std::io::Write;
+    if let Some(arc) = f {
+        if let Ok(mut g) = arc.lock() {
+            let _ = writeln!(g, "[{}] {}", src, text);
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Rendering
+// ══════════════════════════════════════════════════════════════════════════════
+
+impl eframe::App for ProConductor {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_events();
+        ctx.request_repaint_after(Duration::from_secs(1));
+        self.render_topbar(ctx);
+        self.render_sidebar(ctx);
+        self.render_main(ctx);
+        self.render_confirm_dialog(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Kill all child processes before the window closes.
+        // The exclusive file lock (_lock) is released automatically when self is dropped.
+        self.stop_all();
+    }
+}
+
+impl ProConductor {
+
+    // ── Topbar ─────────────────────────────────────────────────────────────
+
+    fn render_topbar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("topbar")
+            .exact_height(48.0)
+            .frame(egui::Frame::none().fill(BG_PANEL).inner_margin(egui::Margin::symmetric(14.0, 0.0)))
+            .show(ctx, |ui| {
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.visuals_mut().override_text_color = Some(TEXT_PRI);
+
+                    // Logo
+                    egui::Frame::none()
+                        .fill(BLUE)
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::symmetric(7.0, 4.0))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("▶").size(13.0).color(Color32::WHITE).strong());
+                        });
+                    ui.label(RichText::new("ProConductor").size(13.0).strong().color(TEXT_PRI));
+
+                    // Config file name
+                    let fname = self.config_path.file_name()
+                        .unwrap_or_default().to_string_lossy();
+                    ui.label(RichText::new(format!("/ {}", fname)).size(11.0).color(TEXT_MUTED));
+
+                    if self.dirty {
+                        ui.label(RichText::new("●").color(AMBER).size(10.0));
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(4.0);
+
+                        // Stop All
+                        let stopped = self.running_count() == 0;
+                        let stop_btn = egui::Button::new(
+                            RichText::new("■  Stop All").size(12.0).color(if stopped { RED_DIM } else { RED })
+                        ).fill(RED_BG).stroke(Stroke::new(1.0, if stopped { RED_DIM } else { RED }));
+                        if ui.add_enabled(!stopped, stop_btn).clicked() { self.stop_all(); }
+
+                        ui.add_space(6.0);
+
+                        // Start All
+                        let all_running = self.running_count() == self.total_count() && self.total_count() > 0;
+                        let start_btn = egui::Button::new(
+                            RichText::new("▶  Start All").size(12.0).color(if all_running { GREEN_DIM } else { GREEN })
+                        ).fill(GREEN_BG).stroke(Stroke::new(1.0, if all_running { GREEN_DIM } else { GREEN }));
+                        if ui.add_enabled(!all_running && self.total_count() > 0, start_btn).clicked() {
+                            self.start_all();
+                        }
+
+                        ui.add_space(10.0);
+
+                        // Status pill
+                        let run = self.running_count();
+                        let tot = self.total_count();
+                        egui::Frame::none()
+                            .fill(BG_CARD)
+                            .rounding(12.0)
+                            .stroke(Stroke::new(1.0, BORDER))
+                            .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("●").color(GREEN).size(9.0));
+                                    ui.label(RichText::new(format!("{}", run)).size(11.0).color(TEXT_PRI));
+                                    ui.label(RichText::new("/").size(11.0).color(TEXT_DIM));
+                                    ui.label(RichText::new(format!("{}", tot)).size(11.0).color(TEXT_MUTED));
+                                });
+                            });
+
+                        // Save
+                        if self.dirty {
+                            let save_btn = egui::Button::new(
+                                RichText::new("💾 Save").size(11.0).color(AMBER)
+                            ).fill(Color32::from_rgb(30, 20, 7)).stroke(Stroke::new(1.0, Color32::from_rgb(74, 48, 10)));
+                            if ui.add(save_btn).clicked() {
+                                save_config(&self.config, &self.config_path);
+                                self.dirty = false;
+                            }
+                        }
+                    });
+                });
+            });
+    }
+
+    // ── Sidebar ────────────────────────────────────────────────────────────
+
+    fn render_sidebar(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("sidebar")
+            .default_width(240.0)
+            .width_range(180.0..=340.0)
+            .frame(egui::Frame::none().fill(BG_PANEL)
+                .stroke(Stroke::new(1.0, BORDER))
+                .inner_margin(egui::Margin::same(0.0)))
+            .show(ctx, |ui| {
+                // Header
+                egui::Frame::none()
+                    .fill(BG_PANEL)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .inner_margin(egui::Margin { left: 14.0, right: 8.0, top: 9.0, bottom: 9.0 })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("APPLICATIONS").size(10.0).color(TEXT_MUTED).strong());
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.small_button(RichText::new("+").size(14.0).color(TEXT_SEC)).on_hover_text("New application group").clicked() {
+                                    let gid = Uuid::new_v4().to_string();
+                                    self.config.groups.push(Group {
+                                        id: gid.clone(), name: "New Application".into(), components: vec![],
+                                    });
+                                    self.open_groups.insert(gid.clone());
+                                    self.selected_group = Some(gid);
+                                    self.dirty = true;
+                                }
+                            });
+                        });
+                    });
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+
+                    if self.config.groups.is_empty() {
+                        ui.add_space(20.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("No groups yet.").color(TEXT_MUTED).size(11.0));
+                            ui.label(RichText::new("Click + to create one.").color(TEXT_DIM).size(10.0));
+                        });
+                    }
+
+                    let group_ids: Vec<String> = self.config.groups.iter().map(|g| g.id.clone()).collect();
+                    for gid in group_ids {
+                        self.render_sidebar_group(ui, &gid.clone());
+                    }
+
+                    ui.add_space(8.0);
+                });
+
+                // Footer
+                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+                    egui::Frame::none()
+                        .fill(BG_PANEL)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .inner_margin(egui::Margin::same(10.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            let has_group = self.selected_group.is_some();
+                            let btn = egui::Button::new(
+                                RichText::new("+ Add Component").size(11.0)
+                                    .color(if has_group { TEXT_SEC } else { TEXT_DIM })
+                            ).fill(if has_group { BG_CARD } else { BG_PANEL })
+                             .stroke(Stroke::new(1.0, if has_group { BORDER_HI } else { BORDER }))
+                             .min_size(Vec2::new(ui.available_width() - 4.0, 0.0));
+                            if ui.add_enabled(has_group, btn).clicked() {
+                                if let Some(gid) = self.selected_group.clone() {
+                                    let new_comp = Component::new();
+                                    self.edit = Some(EditState {
+                                        component: new_comp, group_id: gid, is_new: true,
+                                    });
+                                    self.view = MainView::Edit;
+                                }
+                            }
+                        });
+                });
+            });
+    }
+
+    fn render_sidebar_group(&mut self, ui: &mut egui::Ui, gid: &str) {
+        let group_idx = match self.config.groups.iter().position(|g| g.id == gid) {
+            Some(i) => i, None => return,
+        };
+        let group_name = self.config.groups[group_idx].name.clone();
+        let comp_count = self.config.groups[group_idx].components.len();
+        let is_open    = self.open_groups.contains(gid);
+        let is_sel_grp = self.selected_group.as_deref() == Some(gid);
+
+        // Group header row
+        let header_fill = if is_sel_grp { BG_SEL } else { Color32::TRANSPARENT };
+        egui::Frame::none().fill(header_fill).inner_margin(egui::Margin { left: 8.0, right: 6.0, top: 4.0, bottom: 4.0 }).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let arrow = if is_open { "▾" } else { "▸" };
+                if ui.add(egui::Label::new(
+                    RichText::new(arrow).size(11.0).color(TEXT_MUTED)
+                ).sense(egui::Sense::click())).clicked() {
+                    if is_open { self.open_groups.remove(gid); }
+                    else       { self.open_groups.insert(gid.to_string()); }
+                }
+
+                // Editable group name
+                let mut name_buf = group_name.clone();
+                let te = egui::TextEdit::singleline(&mut name_buf)
+                    .font(egui::TextStyle::Body)
+                    .desired_width(120.0)
+                    .frame(false)
+                    .text_color(if is_sel_grp { TEXT_PRI } else { TEXT_SEC });
+                if ui.add(te).changed() {
+                    self.config.groups[group_idx].name = name_buf;
+                    self.dirty = true;
+                }
+                if ui.add(egui::Label::new(RichText::new(format!("{}", comp_count)).size(10.0).color(TEXT_DIM)).sense(egui::Sense::click())).clicked() {
+                    self.selected_group = Some(gid.to_string());
+                }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button(RichText::new("✕").size(9.0).color(TEXT_DIM)).on_hover_text("Delete group").clicked() {
+                        self.confirm_delete = Some(("group".into(), gid.to_string()));
+                    }
+                });
+            });
+        });
+
+        if !is_open { return; }
+
+        let comp_ids: Vec<String> = self.config.groups[group_idx].components.iter().map(|c| c.id.clone()).collect();
+        for cid in comp_ids {
+            self.render_sidebar_component(ui, &cid.clone());
+        }
+    }
+
+    fn render_sidebar_component(&mut self, ui: &mut egui::Ui, cid: &str) {
+        let comp = self.config.groups.iter()
+            .flat_map(|g| g.components.iter())
+            .find(|c| c.id == cid)
+            .cloned();
+        let comp = match comp { Some(c) => c, None => return };
+
+        let is_running = self.running.contains_key(cid);
+        let is_sel     = self.selected_comp.as_deref() == Some(cid);
+        let dot_color  = if is_running { GREEN } else { TEXT_DIM };
+
+        let bg = if is_sel { BG_SEL } else { Color32::TRANSPARENT };
+        let response = egui::Frame::none()
+            .fill(bg)
+            .stroke(Stroke::new(if is_sel { 1.0 } else { 0.0 }, if is_sel { BLUE } else { Color32::TRANSPARENT }))
+            .inner_margin(egui::Margin { left: 28.0, right: 8.0, top: 4.0, bottom: 4.0 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    // Status dot
+                    let (resp, painter) = ui.allocate_painter(Vec2::splat(10.0), egui::Sense::hover());
+                    let c = resp.rect.center();
+                    painter.circle_filled(c, 4.0, dot_color);
+                    if is_running { painter.circle_stroke(c, 5.5, Stroke::new(1.0, Color32::from_rgba_premultiplied(33, 212, 126, 60))); }
+
+                    ui.label(RichText::new(&comp.name).size(12.0)
+                        .color(if is_sel { TEXT_PRI } else { TEXT_SEC }));
+                });
+            }).response;
+
+        if ui.interact(response.rect, ui.id().with(cid), egui::Sense::click()).clicked() {
+            self.selected_comp  = Some(cid.to_string());
+            let gid = self.config.groups.iter()
+                .find(|g| g.components.iter().any(|c| c.id == cid))
+                .map(|g| g.id.clone());
+            self.selected_group = gid;
+            // Always go back to Dashboard when switching components
+            self.view = MainView::Dashboard;
+            self.edit = None;
+        }
+    }
+
+    // ── Main panel ─────────────────────────────────────────────────────────
+
+    fn render_main(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(BG_BASE))
+            .show(ctx, |ui| {
+                // Dashboard is the root view.
+                // Log and Configure are full-screen overlays with their own ← Back header.
+                if let Some(edit) = self.edit.clone() {
+                    self.render_edit_view(ui, edit);
+                } else if self.view == MainView::Log {
+                    self.render_log_view(ui);
+                } else {
+                    self.view = MainView::Dashboard;
+                    self.render_dashboard(ui);
+                }
+            });
+    }
+
+    // ── Dashboard ──────────────────────────────────────────────────────────
+
+    fn render_dashboard(&mut self, ui: &mut egui::Ui) {
+        if self.config.groups.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.label(RichText::new("⚙").size(40.0).color(TEXT_DIM));
+                ui.add_space(12.0);
+                ui.label(RichText::new("Welcome to ProConductor").size(18.0).color(TEXT_SEC));
+                ui.add_space(6.0);
+                ui.label(RichText::new("Create a group in the sidebar, then add\ncomponents to orchestrate your application.").size(12.0).color(TEXT_MUTED));
+                ui.add_space(16.0);
+                if ui.button(RichText::new("+ Create First Group").size(12.0).color(BLUE)).clicked() {
+                    let gid = Uuid::new_v4().to_string();
+                    self.config.groups.push(Group { id: gid.clone(), name: "My App".into(), components: vec![] });
+                    self.open_groups.insert(gid.clone());
+                    self.selected_group = Some(gid);
+                    self.dirty = true;
+                }
+            });
+            return;
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(16.0);
+            let groups: Vec<(String, String, Vec<String>)> = self.config.groups.iter()
+                .map(|g| (g.id.clone(), g.name.clone(), g.components.iter().map(|c| c.id.clone()).collect()))
+                .collect();
+
+            for (gid, gname, comp_ids) in groups {
+                ui.add_space(4.0);
+                egui::Frame::none()
+                    .inner_margin(egui::Margin { left: 20.0, right: 20.0, top: 0.0, bottom: 0.0 })
+                    .show(ui, |ui| {
+                        // Group header with per-group start/stop
+                        let (g_running, g_total) = self.group_running_count(&gid);
+                        let mut do_start_group = false;
+                        let mut do_stop_group  = false;
+
+                        egui::Frame::none()
+                            .fill(BG_RAISED)
+                            .rounding(6.0)
+                            .stroke(Stroke::new(1.0, BORDER))
+                            .inner_margin(egui::Margin { left: 12.0, right: 8.0, top: 7.0, bottom: 7.0 })
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    // Status dot for group
+                                    let (r, painter) = ui.allocate_painter(Vec2::splat(10.0), egui::Sense::hover());
+                                    let c = r.rect.center();
+                                    let gc = if g_running == g_total && g_total > 0 { GREEN }
+                                             else if g_running > 0 { AMBER }
+                                             else { TEXT_DIM };
+                                    painter.circle_filled(c, 4.0, gc);
+
+                                    ui.label(RichText::new(&gname).size(12.0).color(TEXT_PRI).strong());
+
+                                    // Running count badge
+                                    egui::Frame::none()
+                                        .fill(BG_BASE).rounding(10.0)
+                                        .stroke(Stroke::new(1.0, BORDER))
+                                        .inner_margin(egui::Margin::symmetric(7.0, 2.0))
+                                        .show(ui, |ui| {
+                                            ui.label(RichText::new(format!("{}/{}", g_running, g_total))
+                                                .size(10.0).color(if g_running > 0 { GREEN } else { TEXT_MUTED })
+                                                .monospace());
+                                        });
+
+                                    // Group start/stop buttons — right side, added after fixed-size left content
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.spacing_mut().button_padding = Vec2::new(8.0, 4.0);
+                                        let all_stopped = g_running == 0;
+                                        let all_running = g_running == g_total && g_total > 0;
+
+                                        if ui.add_enabled(!all_stopped, egui::Button::new(
+                                            RichText::new("Stop group").size(11.0).color(if all_stopped { RED_DIM } else { RED }))
+                                            .fill(RED_BG).stroke(Stroke::new(1.0, if all_stopped { RED_DIM } else { RED })))
+                                            .clicked() { do_stop_group = true; }
+
+                                        if ui.add_enabled(!all_running, egui::Button::new(
+                                            RichText::new("Start group").size(11.0).color(if all_running { GREEN_DIM } else { GREEN }))
+                                            .fill(GREEN_BG).stroke(Stroke::new(1.0, if all_running { GREEN_DIM } else { GREEN })))
+                                            .clicked() { do_start_group = true; }
+                                    });
+                                });
+                            });
+
+                        if do_start_group { self.start_group(&gid); }
+                        if do_stop_group  { self.stop_group(&gid); }
+
+                        ui.add_space(6.0);
+
+                        if comp_ids.is_empty() {
+                            ui.label(RichText::new("No components. Add one using the sidebar.").size(11.0).color(TEXT_DIM));
+                        }
+
+                        for cid in comp_ids {
+                            self.render_component_card(ui, &cid.clone());
+                            ui.add_space(4.0);
+                        }
+                    });
+                ui.add_space(12.0);
+            }
+        });
+    }
+
+    fn render_component_card(&mut self, ui: &mut egui::Ui, cid: &str) {
+        let comp = match self.config.groups.iter().flat_map(|g| g.components.iter()).find(|c| c.id == cid).cloned() {
+            Some(c) => c, None => return,
+        };
+        let is_running   = self.running.contains_key(cid);
+        let handle_info  = self.running.get(cid).map(|h| (h.pid, h.started_at));
+        let is_sel       = self.selected_comp.as_deref() == Some(cid);
+        let border_color = if is_running { GREEN_DIM } else { BORDER };
+        let bg           = if is_sel { BG_SEL } else { BG_CARD };
+
+        let mut do_start     = false;
+        let mut do_stop      = false;
+        let mut do_log       = false;
+        let mut do_configure = false;
+        let mut do_delete    = false;
+        let mut do_open_log  = false;
+
+        egui::Frame::none()
+            .fill(bg)
+            .rounding(6.0)
+            .stroke(Stroke::new(1.0, border_color))
+            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+
+                // ── In egui, right-to-left widgets must be added BEFORE left-to-right
+                // ones in the same horizontal strip, otherwise the left widget expands
+                // to fill all space and the button rects end up with zero effective area.
+                // Strategy: reserve button space first, then fill name/meta on the left.
+
+                // Measure available width and reserve the right portion for buttons
+                let total_w = ui.available_width();
+
+                ui.horizontal(|ui| {
+                    // LEFT: status dot + name/meta — does NOT use remaining width greedy
+                    let (r, painter) = ui.allocate_painter(Vec2::splat(12.0), egui::Sense::hover());
+                    let center = r.rect.center();
+                    painter.circle_filled(center, 5.0, if is_running { GREEN } else { TEXT_DIM });
+                    if is_running {
+                        painter.circle_stroke(center, 7.0, Stroke::new(1.0, Color32::from_rgba_premultiplied(33,212,126,60)));
+                    }
+
+                    // Name/meta column with explicit max width so buttons get space
+                    let left_w = (total_w * 0.55).max(160.0);
+                    ui.allocate_ui(Vec2::new(left_w, 0.0), |ui| {
+                        ui.vertical(|ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(&comp.name).size(13.0).strong().color(TEXT_PRI));
+                                if is_running {
+                                    egui::Frame::none().fill(GREEN_BG).rounding(4.0)
+                                        .stroke(Stroke::new(1.0, GREEN_DIM))
+                                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                        .show(ui, |ui| {
+                                            ui.label(RichText::new("RUNNING").size(9.0).color(GREEN).strong());
+                                        });
+                                    if let Some((pid, started)) = handle_info {
+                                        ui.label(RichText::new(format!("PID {}", pid)).size(9.0).color(TEXT_MUTED).monospace());
+                                        ui.label(RichText::new(format_uptime(started)).size(10.0).color(GREEN));
+                                    }
+                                } else {
+                                    egui::Frame::none().fill(BG_BASE).rounding(4.0)
+                                        .stroke(Stroke::new(1.0, BORDER))
+                                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                        .show(ui, |ui| {
+                                            ui.label(RichText::new("STOPPED").size(9.0).color(TEXT_DIM));
+                                        });
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 12.0;
+                                if !comp.executable.is_empty() {
+                                    let exe = comp.executable.split(&['/', '\\'][..]).last().unwrap_or(&comp.executable);
+                                    meta_item(ui, "exe", exe);
+                                }
+                                if !comp.working_dir.is_empty() {
+                                    let dir = comp.working_dir.split(&['/', '\\'][..]).last().unwrap_or(&comp.working_dir);
+                                    meta_item(ui, "dir", dir);
+                                }
+                                if !comp.args.is_empty() {
+                                    let short = if comp.args.len() > 36 { format!("{}…", &comp.args[..36]) } else { comp.args.clone() };
+                                    meta_item(ui, "args", &short);
+                                }
+                            });
+                        });
+                    });
+
+                    // RIGHT: buttons — added into remaining space with right-to-left layout
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().button_padding = Vec2::new(8.0, 5.0);
+
+                        // Delete — disabled while running, always confirms
+                        let del_btn = egui::Button::new(RichText::new("Delete").size(11.0).color(if is_running { TEXT_DIM } else { RED }))
+                            .fill(if is_running { BG_PANEL } else { RED_BG })
+                            .stroke(Stroke::new(1.0, if is_running { BORDER } else { RED_DIM }));
+                        if ui.add_enabled(!is_running, del_btn)
+                            .on_hover_text(if is_running { "Stop the process first" } else { "Delete component" })
+                            .clicked() { do_delete = true; }
+
+                        // Configure
+                        if ui.add(egui::Button::new(RichText::new("Config").size(11.0).color(TEXT_MUTED))
+                            .fill(BG_PANEL).stroke(Stroke::new(1.0, BORDER)))
+                            .on_hover_text("Configure component").clicked() { do_configure = true; }
+
+                        // Open log file — resolved path
+                        if !comp.log_path.is_empty() {
+                            let base_dir = self.config_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+                            let resolved = resolve_log_path(&comp.log_path, &comp.name, &base_dir)
+                                .map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                            if ui.add(egui::Button::new(RichText::new("Log file").size(11.0).color(TEXT_SEC))
+                                .fill(BG_PANEL).stroke(Stroke::new(1.0, BORDER)))
+                                .on_hover_text(&resolved).clicked() { do_open_log = true; }
+                        }
+
+                        // View logs in-app
+                        let log_count = self.logs.get(cid).map(|l| l.len()).unwrap_or(0);
+                        let log_lbl = if log_count > 0 { format!("Logs ({})", log_count) } else { "Logs".into() };
+                        if ui.add(egui::Button::new(RichText::new(log_lbl).size(11.0).color(BLUE))
+                            .fill(BLUE_DIM).stroke(Stroke::new(1.0, Color32::from_rgb(30, 50, 120))))
+                            .on_hover_text("View live log output").clicked() { do_log = true; }
+
+                        // Start / Stop
+                        if is_running {
+                            if ui.add(egui::Button::new(RichText::new("Stop").size(11.0).color(RED))
+                                .fill(RED_BG).stroke(Stroke::new(1.0, RED_DIM))).clicked() { do_stop = true; }
+                        } else {
+                            if ui.add(egui::Button::new(RichText::new("Start").size(11.0).color(GREEN))
+                                .fill(GREEN_BG).stroke(Stroke::new(1.0, GREEN_DIM))).clicked() { do_start = true; }
+                        }
+                    });
+                });
+            });
+
+        if do_start     { self.start(&comp); }
+        if do_stop      { self.stop(cid); }
+        if do_log       { self.selected_comp = Some(cid.to_string()); self.view = MainView::Log; }
+        if do_open_log  {
+            let base_dir = self.config_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+            if let Some(resolved) = resolve_log_path(&comp.log_path, &comp.name, &base_dir) {
+                open_path(&resolved.to_string_lossy());
+            }
+        }
+        if do_configure {
+            let gid = self.config.groups.iter()
+                .find(|g| g.components.iter().any(|c| c.id == cid))
+                .map(|g| g.id.clone()).unwrap_or_default();
+            self.edit = Some(EditState { component: comp.clone(), group_id: gid, is_new: false });
+            self.view = MainView::Edit;
+        }
+        if do_delete    { self.confirm_delete = Some(("component".into(), cid.to_string())); }
+    }
+    // ── Log view ───────────────────────────────────────────────────────────
+
+    fn render_log_view(&mut self, ui: &mut egui::Ui) {
+        let comp = match self.selected_comp.as_ref().and_then(|id| {
+            self.config.groups.iter().flat_map(|g| g.components.iter()).find(|c| c.id == *id).cloned()
+        }) { Some(c) => c, None => { self.view = MainView::Dashboard; self.render_dashboard(ui); return; } };
+
+        let logs = self.logs.get(&comp.id).cloned().unwrap_or_default();
+        let filter = self.log_filter.clone();
+
+        let base_dir = self.config_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        let resolved_log = resolve_log_path(&comp.log_path, &comp.name, &base_dir)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let mut do_back   = false;
+        let mut do_clear  = false;
+        let mut do_open   = false;
+        let mut do_reveal = false;
+
+        // Breadcrumb header — matches style of Configure header
+        egui::Frame::none()
+            .fill(BG_PANEL)
+            .stroke(Stroke::new(1.0, BORDER))
+            .inner_margin(egui::Margin::symmetric(14.0, 9.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    if ui.small_button(RichText::new("← Dashboard").size(11.0).color(TEXT_SEC)).clicked() {
+                        do_back = true;
+                    }
+                    // Right: log actions — added before expanding content
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if !resolved_log.is_empty() {
+                            if ui.small_button(RichText::new("📁 Reveal").size(11.0)).on_hover_text(&resolved_log).clicked() {
+                                do_reveal = true;
+                            }
+                            if ui.small_button(RichText::new("📄 Open").size(11.0)).on_hover_text(&resolved_log).clicked() {
+                                do_open = true;
+                            }
+                        }
+                        if ui.small_button(RichText::new("Clear").size(11.0).color(TEXT_MUTED)).clicked() {
+                            do_clear = true;
+                        }
+                        ui.checkbox(&mut self.log_autoscroll, RichText::new("Auto-scroll").size(11.0).color(TEXT_MUTED));
+                        ui.add(egui::TextEdit::singleline(&mut self.log_filter)
+                            .hint_text("Filter…")
+                            .desired_width(150.0)
+                            .font(egui::TextStyle::Monospace));
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.label(RichText::new(&comp.name).size(12.0).color(TEXT_PRI).strong());
+                            ui.label(RichText::new("— Logs").size(11.0).color(TEXT_MUTED));
+                            ui.label(RichText::new(format!("({} lines)", logs.len())).size(10.0).color(TEXT_DIM));
+                        });
+                    });
+                });
+            });
+
+        if do_back   { self.view = MainView::Dashboard; return; }
+        if do_clear  { self.logs.remove(&comp.id); }
+        if do_open   { open_path(&resolved_log); }
+        if do_reveal { reveal_path(&resolved_log); }
+
+        // Log output
+        let scroll = egui::ScrollArea::vertical()
+            .stick_to_bottom(self.log_autoscroll)
+            .auto_shrink([false; 2]);
+
+        scroll.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for line in &logs {
+                if !filter.is_empty() && !line.text.to_lowercase().contains(&filter.to_lowercase()) {
+                    continue;
+                }
+
+                // Only treat a line as a real error if it looks like one.
+                // Python, Flask, and many other tools write access logs to stderr —
+                // coloring all stderr red is misleading.
+                let is_real_error = line.source == Source::Stderr && {
+                    let l = line.text.to_lowercase();
+                    l.contains("error") || l.contains("exception") || l.contains("traceback")
+                    || l.contains("fatal") || l.contains("panic") || l.contains("critical")
+                    || l.starts_with("  file \"") // Python traceback continuation
+                };
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&line.time).size(10.5).color(TEXT_DIM).monospace());
+                    ui.add_space(2.0);
+                    let (src_text, src_color) = match line.source {
+                        Source::Stdout => ("OUT", BLUE),
+                        Source::Stderr => if is_real_error { ("ERR", RED) } else { ("ERR", TEXT_MUTED) },
+                        Source::System => ("SYS", AMBER),
+                    };
+                    ui.label(RichText::new(src_text).size(10.0).color(src_color).monospace().strong());
+                    ui.add_space(2.0);
+                    let tc = if is_real_error { Color32::from_rgb(240, 120, 130) } else { TEXT_PRI };
+                    ui.label(RichText::new(&line.text).size(11.5).color(tc).monospace());
+                });
+            }
+            if logs.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label(RichText::new("No output yet — start the component to see logs.").size(11.0).color(TEXT_DIM).monospace());
+                });
+            }
+        });
+    }
+
+    // ── Edit view ──────────────────────────────────────────────────────────
+
+    fn render_edit_view(&mut self, ui: &mut egui::Ui, mut edit: EditState) {
+        let mut do_back   = false;
+        let mut do_save   = false;
+        let mut do_delete = false;
+
+        // Header — buttons use fixed width so Back isn't squeezed to zero
+        egui::Frame::none()
+            .fill(BG_PANEL)
+            .stroke(Stroke::new(1.0, BORDER))
+            .inner_margin(egui::Margin::symmetric(14.0, 9.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    // Back — added first so it gets a real rect before right-side layout claims space
+                    if ui.small_button(RichText::new("← Dashboard").size(11.0).color(TEXT_SEC)).clicked() {
+                        do_back = true;
+                    }
+                    // Right-side buttons — must be added before the expanding label
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if !edit.is_new {
+                            if ui.add(egui::Button::new(RichText::new("Delete").size(12.0).color(RED))
+                                .fill(RED_BG).stroke(Stroke::new(1.0, RED_DIM))).clicked() {
+                                do_delete = true;
+                            }
+                        }
+                        if ui.add(egui::Button::new(RichText::new("Save").size(12.0).color(GREEN))
+                            .fill(GREEN_BG).stroke(Stroke::new(1.0, GREEN_DIM))).clicked() {
+                            do_save = true;
+                        }
+                        // Title fills leftover space between Back and the right buttons
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.label(RichText::new(if edit.is_new { "New Component" } else { "Configure Component" })
+                                .size(13.0).strong().color(TEXT_PRI));
+                        });
+                    });
+                });
+            });
+
+        // Apply header actions before rendering the scroll area
+        if do_back {
+            self.edit = None;
+            self.view = MainView::Dashboard;
+            return;
+        }
+        if do_delete {
+            self.confirm_delete = Some(("component".into(), edit.component.id.clone()));
+            self.edit = None;
+            return;
+        }
+        if do_save {
+            let c = edit.component.clone();
+            if edit.is_new {
+                if let Some(g) = self.config.groups.iter_mut().find(|g| g.id == edit.group_id) {
+                    g.components.push(c.clone());
+                }
+                self.selected_comp = Some(c.id.clone());
+            } else {
+                for g in &mut self.config.groups {
+                    if let Some(slot) = g.components.iter_mut().find(|x| x.id == c.id) {
+                        *slot = c.clone();
+                    }
+                }
+            }
+            save_config(&self.config, &self.config_path);
+            self.dirty = false;
+            self.edit  = None;
+            self.view  = MainView::Dashboard;
+            return;
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(12.0);
+            let c = &mut edit.component;
+            let p = self.config_path.clone();
+            let dirty = &mut self.dirty;
+
+            egui::Frame::none()
+                .inner_margin(egui::Margin::symmetric(24.0, 0.0))
+                .show(ui, |ui| {
+                    // Identity
+                    section_title(ui, "IDENTITY");
+                    ui.add_space(4.0);
+                    field_row(ui, "Display Name", |ui| {
+                        if ui.add(egui::TextEdit::singleline(&mut c.name).hint_text("e.g. API Server")).changed() { *dirty = true; }
+                    });
+
+                    ui.add_space(14.0);
+                    section_title(ui, "EXECUTION");
+                    ui.add_space(4.0);
+
+                    field_row(ui, "Executable", |ui| {
+                        if ui.small_button("Browse").clicked() {
+                            if let Some(p) = rfd::FileDialog::new().set_title("Select Executable").pick_file() {
+                                c.executable = p.to_string_lossy().to_string(); *dirty = true;
+                            }
+                        }
+                        if ui.add(egui::TextEdit::singleline(&mut c.executable)
+                            .hint_text(if cfg!(windows) { r"C:\path\to\app.exe" } else { "/usr/bin/node" })
+                            .desired_width(ui.available_width())).changed() { *dirty = true; }
+                    });
+                    field_row(ui, "Arguments", |ui| {
+                        if ui.add(egui::TextEdit::singleline(&mut c.args).hint_text(r#"--port 8080 --config "my config.json""#).desired_width(f32::INFINITY)).changed() { *dirty = true; }
+                    });
+                    field_row(ui, "Working Dir", |ui| {
+                        if ui.small_button("Browse").clicked() {
+                            if let Some(p) = rfd::FileDialog::new().set_title("Select Working Directory").pick_folder() {
+                                c.working_dir = p.to_string_lossy().to_string(); *dirty = true;
+                            }
+                        }
+                        if ui.add(egui::TextEdit::singleline(&mut c.working_dir)
+                            .hint_text(if cfg!(windows) { r"C:\projects\myapp" } else { "/opt/myapp" })
+                            .desired_width(ui.available_width())).changed() { *dirty = true; }
+                    });
+
+                    ui.add_space(14.0);
+                    section_title(ui, "LOGGING");
+                    ui.add_space(4.0);
+                    field_row(ui, "Log File Path", |ui| {
+                        ui.label(RichText::new("{name} {date}").size(9.0).color(TEXT_DIM).monospace());
+                        if ui.small_button("Browse").clicked() {
+                            if let Some(p) = rfd::FileDialog::new()
+                                .add_filter("Log", &["log","txt"]).save_file() {
+                                c.log_path = p.to_string_lossy().to_string(); *dirty = true;
+                            }
+                        }
+                        if ui.add(egui::TextEdit::singleline(&mut c.log_path)
+                            .hint_text(if cfg!(windows) { r"C:\logs\{name}-{date}.log" } else { "/var/log/{name}-{date}.log" })
+                            .desired_width(ui.available_width())).changed() { *dirty = true; }
+                    });
+
+                    ui.add_space(14.0);
+                    section_title(ui, "SECURITY");
+                    ui.add_space(4.0);
+                    field_row(ui, "Run as User", |ui| {
+                        ui.label(RichText::new("Unix: sudo -u").size(9.0).color(TEXT_DIM));
+                        if ui.add(egui::TextEdit::singleline(&mut c.run_as_user).hint_text("e.g. www-data").desired_width(200.0)).changed() { *dirty = true; }
+                    });
+
+                    ui.add_space(14.0);
+                    section_title(ui, "ENVIRONMENT VARIABLES");
+                    ui.add_space(4.0);
+
+                    // Env var table header
+                    ui.horizontal(|ui| {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new("KEY").size(9.0).color(TEXT_MUTED).strong());
+                        ui.add_space(ui.available_width() / 2.0 - 30.0);
+                        ui.label(RichText::new("VALUE").size(9.0).color(TEXT_MUTED).strong());
+                    });
+                    ui.add(egui::Separator::default().spacing(2.0));
+
+                    let mut to_delete: Option<usize> = None;
+                    for (i, ev) in c.env_vars.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.small_button(RichText::new("✕").size(10.0).color(RED_DIM)).clicked() {
+                                to_delete = Some(i);
+                            }
+                            let w = (ui.available_width() - 8.0) / 2.0;
+                            if ui.add(egui::TextEdit::singleline(&mut ev.key).hint_text("KEY").desired_width(w)).changed() { *dirty = true; }
+                            if ui.add(egui::TextEdit::singleline(&mut ev.value).hint_text("value").desired_width(w)).changed() { *dirty = true; }
+                        });
+                    }
+                    if let Some(idx) = to_delete { c.env_vars.remove(idx); *dirty = true; }
+
+                    ui.add_space(4.0);
+                    if ui.small_button(RichText::new("+ Add Variable").size(11.0).color(TEXT_SEC)).clicked() {
+                        c.env_vars.push(EnvVar::default()); *dirty = true;
+                    }
+
+                    ui.add_space(24.0);
+                });
+            _ = p; // suppress unused warning
+        });
+
+        self.edit = Some(edit);
+    }
+
+    // ── Confirm dialog ─────────────────────────────────────────────────────
+
+    fn render_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some((kind, id)) = self.confirm_delete.clone() else { return };
+
+        // Resolve display name
+        let display_name = if kind == "group" {
+            self.config.groups.iter().find(|g| g.id == id).map(|g| g.name.clone()).unwrap_or_default()
+        } else {
+            self.config.groups.iter().flat_map(|g| g.components.iter()).find(|c| c.id == id).map(|c| c.name.clone()).unwrap_or_default()
+        };
+
+        egui::Window::new(format!("Delete {}?", kind))
+            .collapsible(false).resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(egui::Frame::none().fill(BG_CARD).rounding(8.0).stroke(Stroke::new(1.0, BORDER_HI)).inner_margin(egui::Margin::same(20.0)))
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("\"{}\"", display_name)).size(13.0).color(TEXT_PRI).strong());
+                ui.add_space(6.0);
+                ui.label(RichText::new("This will permanently remove it from the config.").size(11.0).color(TEXT_SEC));
+                ui.add_space(14.0);
+                // Cancel first so it gets a real rect (right-to-left would squeeze it)
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(RichText::new("Cancel").size(12.0))
+                        .min_size(Vec2::new(80.0, 0.0))).clicked() {
+                        self.confirm_delete = None;
+                    }
+                    if ui.add(egui::Button::new(RichText::new("Delete").size(12.0).color(RED))
+                        .fill(RED_BG).stroke(Stroke::new(1.0, RED_DIM))
+                        .min_size(Vec2::new(80.0, 0.0))).clicked() {
+                        if kind == "group" {
+                            self.config.groups.retain(|g| g.id != id);
+                            if self.selected_group.as_deref() == Some(&id) { self.selected_group = None; }
+                        } else {
+                            for g in &mut self.config.groups {
+                                g.components.retain(|c| c.id != id);
+                            }
+                            if self.selected_comp.as_deref() == Some(&id) { self.selected_comp = None; }
+                        }
+                        save_config(&self.config, &self.config_path);
+                        self.confirm_delete = None;
+                        self.edit = None;
+                    }
+                });
+            });
+    }
+}
+
+// ── UI helpers ─────────────────────────────────────────────────────────────
+
+fn section_title(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(9.5).color(TEXT_MUTED).strong());
+    ui.add(egui::Separator::default().spacing(6.0));
+}
+
+fn field_row(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.add_sized([130.0, 20.0], egui::Label::new(RichText::new(label).size(11.0).color(TEXT_SEC)));
+        content(ui);
+    });
+    ui.add_space(6.0);
+}
+
+fn meta_item(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(10.0).color(TEXT_DIM).monospace());
+        ui.label(RichText::new(value).size(10.0).color(TEXT_MUTED).monospace());
+    });
+}
+
+fn open_path(path: &str) {
+    #[cfg(target_os = "windows")] { let _ = Command::new("explorer").arg(path).spawn(); }
+    #[cfg(target_os = "macos")]   { let _ = Command::new("open").arg(path).spawn(); }
+    #[cfg(target_os = "linux")]   { let _ = Command::new("xdg-open").arg(path).spawn(); }
+}
+
+fn reveal_path(path: &str) {
+    let p = PathBuf::from(path);
+    let dir = if p.is_file() { p.parent().unwrap_or(&p).to_string_lossy().to_string() } else { path.to_string() };
+    open_path(&dir);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PID lock — one instance per config file, survives crashes cleanly
+// ══════════════════════════════════════════════════════════════════════════════
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Entry point
+// ══════════════════════════════════════════════════════════════════════════════
+
+struct AlreadyRunningApp { msg: String }
+impl eframe::App for AlreadyRunningApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(BG_BASE).inner_margin(egui::Margin::same(24.0)))
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("⚠  Already Running").size(15.0).color(AMBER).strong());
+                    ui.add_space(12.0);
+                    for line in self.msg.lines() {
+                        ui.label(RichText::new(line).size(12.0).color(TEXT_SEC));
+                    }
+                    ui.add_space(16.0);
+                    if ui.button(RichText::new("  OK  ").size(12.0)).clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    // Usage: proconductor [config.json]
+    // Default: proconductor.json in the current directory
+    let config_path: PathBuf = std::env::args().nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("proconductor.json"));
+
+    let config = load_config(&config_path);
+
+    // Single-instance check per config file using an exclusive OS file lock.
+    // The lock is held for the entire process lifetime and released automatically
+    // by the OS on clean exit, crash, or any other termination — no stale state.
+    let lock_path = {
+        let mut p = config_path.clone();
+        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string() + ".lock";
+        p.set_file_name(name);
+        p
+    };
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true).write(true).open(&lock_path)
+        .expect("Could not open lock file");
+    match lock_file.try_lock_exclusive() {
+        Ok(()) => {} // acquired — this is the only instance for this config
+        Err(_) => {
+            let name = config_path.file_name().unwrap_or_default().to_string_lossy();
+            let msg = format!("'{}' is already open in another ProConductor window.
+
+Close that window first.", name);
+            eprintln!("ProConductor: {}", msg);
+            let options = eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default()
+                    .with_title("Already Running")
+                    .with_inner_size([400.0, 130.0])
+                    .with_resizable(false),
+                ..Default::default()
+            };
+            let _ = eframe::run_native(
+                "Already Running",
+                options,
+                Box::new(move |_cc| Box::new(AlreadyRunningApp { msg })),
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let title = format!(
+        "ProConductor — {}",
+        config_path.file_name().unwrap_or_default().to_string_lossy()
+    );
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(&title)
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([900.0, 580.0])
+            .with_icon(eframe::icon_data::from_png_bytes(&[]).unwrap_or_default()),
+        ..Default::default()
+    };
+
+    // Shared PID registry — signal handler kills all children on Ctrl+C / SIGTERM
+    let pid_registry: PidRegistry = Arc::new(Mutex::new(Vec::new()));
+    let registry_for_signal = pid_registry.clone();
+
+    ctrlc::set_handler(move || {
+        // Kill every registered child PID
+        let pids = registry_for_signal.lock().unwrap().clone();
+        for pid in pids {
+            kill_tree(pid);
+        }
+        std::process::exit(0);
+    }).expect("Failed to set signal handler");
+
+    eframe::run_native(
+        &title,
+        options,
+        Box::new(move |cc| Box::new(ProConductor::new(cc, config, config_path, lock_file, pid_registry))),
+    )
+}
