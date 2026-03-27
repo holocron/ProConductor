@@ -263,7 +263,7 @@ struct ProConductor {
 }
 
 impl ProConductor {
-    fn new(cc: &eframe::CreationContext, config: AppConfig, path: PathBuf, lock: std::fs::File, pid_registry: PidRegistry) -> Self {
+    fn new(cc: &eframe::CreationContext, config: AppConfig, path: PathBuf, lock: std::fs::File, pid_registry: PidRegistry, autostart: bool) -> Self {
         // Apply dark theme with our custom palette
         let mut visuals = egui::Visuals::dark();
         visuals.window_fill              = BG_BASE;
@@ -307,7 +307,7 @@ impl ProConductor {
         // Open all groups initially
         let open_groups = config.groups.iter().map(|g| g.id.clone()).collect();
 
-        Self {
+        let mut app = Self {
             config,
             config_path: path,
             dirty: false,
@@ -326,7 +326,9 @@ impl ProConductor {
             log_filter: String::new(),
             log_autoscroll: true,
             confirm_delete: None,
-        }
+        };
+        if autostart { app.start_all(); }
+        app
     }
 
     // ── Process spawning ───────────────────────────────────────────────────
@@ -1509,12 +1511,29 @@ impl eframe::App for AlreadyRunningApp {
     }
 }
 
+fn print_usage() {
+    eprintln!("Usage: proconductor [config.json] [--autostart] [--minimized]");
+    eprintln!();
+    eprintln!("  config.json   Path to config file (default: proconductor.json)");
+    eprintln!("  --autostart   Start all components immediately on launch");
+    eprintln!("  --minimized   Start with window minimized");
+}
+
 fn main() -> eframe::Result<()> {
-    // Usage: proconductor [config.json]
-    // Default: proconductor.json in the current directory
-    let config_path: PathBuf = std::env::args().nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("proconductor.json"));
+    let mut config_path: Option<PathBuf> = None;
+    let mut autostart  = false;
+    let mut minimized  = false;
+
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--autostart"              => autostart = true,
+            "--minimized"              => minimized  = true,
+            "--help" | "-h"            => { print_usage(); std::process::exit(0); }
+            a if a.starts_with('-')    => { eprintln!("Unknown argument: {}", a); print_usage(); std::process::exit(1); }
+            _                          => config_path = Some(PathBuf::from(&arg)),
+        }
+    }
+    let config_path = config_path.unwrap_or_else(|| PathBuf::from("proconductor.json"));
 
     let config = load_config(&config_path);
 
@@ -1564,6 +1583,7 @@ Close that window first.", name);
             .with_title(&title)
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 580.0])
+            .with_minimized(minimized)
             .with_icon(eframe::icon_data::from_png_bytes(&[]).unwrap_or_default()),
         ..Default::default()
     };
@@ -1584,6 +1604,6 @@ Close that window first.", name);
     eframe::run_native(
         &title,
         options,
-        Box::new(move |cc| Box::new(ProConductor::new(cc, config, config_path, lock_file, pid_registry))),
+        Box::new(move |cc| Box::new(ProConductor::new(cc, config, config_path, lock_file, pid_registry, autostart))),
     )
 }
