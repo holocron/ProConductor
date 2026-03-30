@@ -3,6 +3,12 @@
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+
+#[cfg(windows)]
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuItem},
+    TrayIcon, TrayIconBuilder, TrayIconEvent,
+};
 use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
@@ -253,6 +259,8 @@ struct ProConductor {
 
     // UI
     start_minimized: bool,   // send minimize command on first frame
+    #[cfg(windows)]
+    tray_icon: Option<TrayIcon>,   // system tray icon (Windows only)
     selected_comp:  Option<String>,
     selected_group: Option<String>,
     view:           MainView,
@@ -308,6 +316,23 @@ impl ProConductor {
         // Open all groups initially
         let open_groups = config.groups.iter().map(|g| g.id.clone()).collect();
 
+        #[cfg(windows)]
+        let tray_icon = {
+            let icon = tray_icon::Icon::from_rgba(vec![255u8, 255, 255, 255], 1, 1)
+                .unwrap_or_else(|_| tray_icon::Icon::from_rgba(vec![0u8,0,0,255], 1, 1).unwrap());
+            let menu = Menu::new();
+            let show_item = MenuItem::with_id("show", "Show", true, None);
+            let quit_item = MenuItem::with_id("quit", "Quit", true, None);
+            let _ = menu.append(&show_item);
+            let _ = menu.append(&quit_item);
+            TrayIconBuilder::new()
+                .with_menu(Box::new(menu))
+                .with_tooltip("ProConductor")
+                .with_icon(icon)
+                .build()
+                .ok()
+        };
+
         let mut app = Self {
             config,
             config_path: path,
@@ -328,6 +353,8 @@ impl ProConductor {
             log_autoscroll: true,
             confirm_delete: None,
             start_minimized: minimized,
+            #[cfg(windows)]
+            tray_icon,
         };
         if autostart { app.start_all(); }
         app
@@ -566,6 +593,11 @@ impl eframe::App for ProConductor {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             self.start_minimized = false;
         }
+
+        // Windows tray: hide to tray on minimize, handle tray events
+        #[cfg(windows)]
+        self.handle_tray(ctx);
+
         self.drain_events();
         ctx.request_repaint_after(Duration::from_secs(1));
         self.render_topbar(ctx);
@@ -582,6 +614,48 @@ impl eframe::App for ProConductor {
 }
 
 impl ProConductor {
+
+    // ── Tray (Windows only) ───────────────────────────────────────────────────
+
+    #[cfg(windows)]
+    fn handle_tray(&mut self, ctx: &egui::Context) {
+        // Detect window minimize → hide from taskbar, show only in tray
+        let is_minimized = ctx.input(|i| i.viewport().minimized == Some(true));
+        if is_minimized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        }
+
+        // Poll tray icon left-click
+        if let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            if matches!(event, TrayIconEvent::Click { .. }) {
+                self.show_window(ctx);
+            }
+        }
+
+        // Poll tray menu events
+        if let Ok(event) = MenuEvent::receiver().try_recv() {
+            match event.id.0.as_str() {
+                "show" => self.show_window(ctx),
+                "quit" | _ => {
+                    self.stop_all();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        // Keep polling even when hidden
+        if ctx.input(|i| i.viewport().focused == Some(false)) {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    #[cfg(windows)]
+    fn show_window(&self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    }
 
     // ── Topbar ─────────────────────────────────────────────────────────────
 

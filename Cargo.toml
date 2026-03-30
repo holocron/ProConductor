@@ -29,6 +29,10 @@ fs2 = "0.4"
 # Cross-platform Ctrl+C / SIGTERM handler
 ctrlc = { version = "3", features = ["termination"] }
 
+# Windows-only: system tray support
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.14"
+
 [profile.release]
 opt-level     = "s"
 lto           = true
