@@ -252,6 +252,7 @@ struct ProConductor {
     ctx_handle: egui::Context,
 
     // UI
+    start_minimized: bool,   // send minimize command on first frame
     selected_comp:  Option<String>,
     selected_group: Option<String>,
     view:           MainView,
@@ -263,7 +264,7 @@ struct ProConductor {
 }
 
 impl ProConductor {
-    fn new(cc: &eframe::CreationContext, config: AppConfig, path: PathBuf, lock: std::fs::File, pid_registry: PidRegistry, autostart: bool) -> Self {
+    fn new(cc: &eframe::CreationContext, config: AppConfig, path: PathBuf, lock: std::fs::File, pid_registry: PidRegistry, autostart: bool, minimized: bool) -> Self {
         // Apply dark theme with our custom palette
         let mut visuals = egui::Visuals::dark();
         visuals.window_fill              = BG_BASE;
@@ -326,6 +327,7 @@ impl ProConductor {
             log_filter: String::new(),
             log_autoscroll: true,
             confirm_delete: None,
+            start_minimized: minimized,
         };
         if autostart { app.start_all(); }
         app
@@ -336,7 +338,7 @@ impl ProConductor {
     fn start(&mut self, comp: &Component) {
         if self.running.contains_key(&comp.id) { return; }
 
-        let mut args = split_args(&comp.args);
+        let args = split_args(&comp.args);
 
         // sudo -u <user> on Unix
         let exe = if !comp.run_as_user.is_empty() {
@@ -560,6 +562,10 @@ fn write_log_file(f: &Option<Arc<Mutex<std::fs::File>>>, src: &str, text: &str) 
 
 impl eframe::App for ProConductor {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.start_minimized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.start_minimized = false;
+        }
         self.drain_events();
         ctx.request_repaint_after(Duration::from_secs(1));
         self.render_topbar(ctx);
@@ -1583,7 +1589,6 @@ Close that window first.", name);
             .with_title(&title)
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 580.0])
-            .with_minimized(minimized)
             .with_icon(eframe::icon_data::from_png_bytes(&[]).unwrap_or_default()),
         ..Default::default()
     };
@@ -1604,6 +1609,6 @@ Close that window first.", name);
     eframe::run_native(
         &title,
         options,
-        Box::new(move |cc| Box::new(ProConductor::new(cc, config, config_path, lock_file, pid_registry, autostart))),
+        Box::new(move |cc| Box::new(ProConductor::new(cc, config, config_path, lock_file, pid_registry, autostart, minimized))),
     )
 }
