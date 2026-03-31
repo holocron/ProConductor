@@ -482,7 +482,7 @@ impl ProConductor {
     fn start(&mut self, comp: &Component) {
         if self.running.contains_key(&comp.id) { return; }
 
-        let args = split_args(&comp.args);
+        let mut args = split_args(&comp.args);
 
         // sudo -u <user> on Unix
         let exe = if !comp.run_as_user.is_empty() {
