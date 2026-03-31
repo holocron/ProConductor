@@ -317,6 +317,8 @@ struct ProConductor {
     quit_requested:        bool,
     #[cfg(windows)]
     taskbar_hidden: bool,  // whether we've removed the window from taskbar yet
+    #[cfg(windows)]
+    just_hid: bool,        // skip one frame after hiding to avoid instant restore
     selected_comp:  Option<String>,
     selected_group: Option<String>,
     view:           MainView,
@@ -468,6 +470,8 @@ impl ProConductor {
             quit_requested:        false,
             #[cfg(windows)]
             taskbar_hidden: false,
+            #[cfg(windows)]
+            just_hid: false,
         };
         if autostart { app.start_all(); }
         app
@@ -784,7 +788,13 @@ impl ProConductor {
             }
         }
 
-        // Minimize → hide via Win32 (avoids Visible(false) killing the egui loop)
+        // Minimize → hide via Win32
+        // We skip one frame after hiding (just_hid) to avoid the restore that
+        // would otherwise fire when egui processes its own minimize event.
+        if self.just_hid {
+            self.just_hid = false;
+            return;
+        }
         let is_minimized = ctx.input(|i| i.viewport().minimized == Some(true));
         if is_minimized {
             let title: Vec<u16> = ctx.input(|i| i.viewport().title.clone())
@@ -794,8 +804,8 @@ impl ProConductor {
                 let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
                 if hwnd != 0 { ShowWindow(hwnd, SW_HIDE); }
             }
-            // Reset minimized state in egui so it doesn't keep firing
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            self.just_hid = true;
+            // Do NOT send Minimized(false) — that restores the window immediately
         }
     }
 
