@@ -144,8 +144,10 @@ pub struct LogLine {
 }
 
 pub enum AppEvent {
-    Log    { id: String, line: LogLine },
-    Status { id: String, running: bool, pid: Option<u32>, exit_code: Option<i32> },
+    Log         { id: String, line: LogLine },
+    Status      { id: String, running: bool, pid: Option<u32>, exit_code: Option<i32> },
+    ShowWindow,
+    QuitApp,
 }
 
 struct RunningProcess {
@@ -275,6 +277,8 @@ struct ProConductor {
     _tray_icon: Option<TrayIcon>,  // system tray icon (Windows only, kept alive)
     #[cfg(windows)]
     tray_status: u8,               // 0=red 1=amber 2=green — track to avoid redundant swaps
+    show_window_requested: bool,
+    quit_requested:        bool,
     selected_comp:  Option<String>,
     selected_group: Option<String>,
     view:           MainView,
@@ -339,12 +343,42 @@ impl ProConductor {
             let quit_item = MenuItem::with_id("quit", "Quit", true, None);
             let _ = menu.append(&show_item);
             let _ = menu.append(&quit_item);
-            TrayIconBuilder::new()
+            let tray = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
                 .with_tooltip("ProConductor")
                 .with_icon(icon)
                 .build()
-                .ok()
+                .ok();
+
+            // Background thread polls tray events independently of the egui loop.
+            // This is necessary because Visible(false) stops update() from being called.
+            let tx_tray = tx.clone();
+            let ctx_tray = cc.egui_ctx.clone();
+            thread::spawn(move || {
+                loop {
+                    if let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                        if matches!(event, TrayIconEvent::Click { .. }) {
+                            let _ = tx_tray.send(AppEvent::ShowWindow);
+                            ctx_tray.request_repaint();
+                        }
+                    }
+                    if let Ok(event) = MenuEvent::receiver().try_recv() {
+                        match event.id.0.as_str() {
+                            "show" => {
+                                let _ = tx_tray.send(AppEvent::ShowWindow);
+                                ctx_tray.request_repaint();
+                            }
+                            _ => {
+                                let _ = tx_tray.send(AppEvent::QuitApp);
+                                ctx_tray.request_repaint();
+                            }
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
+
+            tray
         };
 
         let mut app = Self {
@@ -371,6 +405,8 @@ impl ProConductor {
             _tray_icon: tray_icon,
             #[cfg(windows)]
             tray_status: 0,
+            show_window_requested: false,
+            quit_requested:        false,
         };
         if autostart { app.start_all(); }
         app
@@ -579,6 +615,8 @@ impl ProConductor {
                 AppEvent::Status { id, running, .. } => {
                     if !running { self.running.remove(&id); }
                 }
+                AppEvent::ShowWindow => { self.show_window_requested = true; }
+                AppEvent::QuitApp    => { self.quit_requested        = true; }
             }
         }
     }
@@ -610,11 +648,23 @@ impl eframe::App for ProConductor {
             self.start_minimized = false;
         }
 
-        // Windows tray: hide to tray on minimize, handle tray events
+        self.drain_events();
+
+        // Handle tray-originated actions (set by background thread via channel)
+        if self.show_window_requested {
+            self.show_window_requested = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if self.quit_requested {
+            self.stop_all();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // Windows tray: update icon color, hide window on minimize
         #[cfg(windows)]
         self.handle_tray(ctx);
-
-        self.drain_events();
         ctx.request_repaint_after(Duration::from_secs(1));
         self.render_topbar(ctx);
         self.render_sidebar(ctx);
@@ -655,42 +705,12 @@ impl ProConductor {
             }
         }
 
-        // Detect window minimize → hide from taskbar, show only in tray
+        // Minimize to tray: when window is minimized, hide it from taskbar.
+        // Restoring is handled via the background tray thread → AppEvent::ShowWindow.
         let is_minimized = ctx.input(|i| i.viewport().minimized == Some(true));
         if is_minimized {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         }
-
-        // Poll tray icon left-click
-        if let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if matches!(event, TrayIconEvent::Click { .. }) {
-                self.show_window(ctx);
-            }
-        }
-
-        // Poll tray menu events
-        if let Ok(event) = MenuEvent::receiver().try_recv() {
-            match event.id.0.as_str() {
-                "show" => self.show_window(ctx),
-                "quit" | _ => {
-                    self.stop_all();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-        }
-
-        // Keep polling even when hidden
-        if ctx.input(|i| i.viewport().focused == Some(false)) {
-            ctx.request_repaint_after(Duration::from_millis(200));
-        }
-    }
-
-    #[cfg(windows)]
-    fn show_window(&self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     }
 
     // ── Topbar ─────────────────────────────────────────────────────────────
