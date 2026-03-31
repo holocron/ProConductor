@@ -506,8 +506,15 @@ impl ProConductor {
         }
         for ev in &comp.env_vars { if !ev.key.is_empty() { cmd.env(&ev.key, &ev.value); } }
 
-        // New process group on Unix for clean tree-kill
+        // Unix: new process group for clean tree-kill
         #[cfg(unix)] { use std::os::unix::process::CommandExt; cmd.process_group(0); }
+
+        // Windows: hide child console windows — stdout/stderr captured via pipes
+        #[cfg(windows)] {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
 
         let child = match cmd.spawn() {
             Ok(c) => c,
