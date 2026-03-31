@@ -9,6 +9,22 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+
+// Win32 FFI — remove window from taskbar via extended window styles
+#[cfg(windows)]
+extern "system" {
+    fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+    fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+    fn SetWindowLongPtrW(hwnd: isize, index: i32, new: isize) -> isize;
+    fn SetWindowPos(hwnd: isize, insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+}
+#[cfg(windows)] const GWL_EXSTYLE:      i32 = -20;
+#[cfg(windows)] const WS_EX_APPWINDOW:  isize = 0x00040000;
+#[cfg(windows)] const WS_EX_TOOLWINDOW: isize = 0x00000080;
+#[cfg(windows)] const SWP_NOMOVE:       u32 = 0x0002;
+#[cfg(windows)] const SWP_NOSIZE:       u32 = 0x0001;
+#[cfg(windows)] const SWP_NOZORDER:     u32 = 0x0004;
+#[cfg(windows)] const SWP_FRAMECHANGED: u32 = 0x0020;
 use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
@@ -279,6 +295,8 @@ struct ProConductor {
     tray_status: u8,               // 0=red 1=amber 2=green — track to avoid redundant swaps
     show_window_requested: bool,
     quit_requested:        bool,
+    #[cfg(windows)]
+    taskbar_hidden: bool,  // whether we've removed the window from taskbar yet
     selected_comp:  Option<String>,
     selected_group: Option<String>,
     view:           MainView,
@@ -407,6 +425,8 @@ impl ProConductor {
             tray_status: 0,
             show_window_requested: false,
             quit_requested:        false,
+            #[cfg(windows)]
+            taskbar_hidden: false,
         };
         if autostart { app.start_all(); }
         app
@@ -705,8 +725,27 @@ impl ProConductor {
             }
         }
 
-        // Minimize to tray: when window is minimized, hide it from taskbar.
-        // Restoring is handled via the background tray thread → AppEvent::ShowWindow.
+        // Remove window from taskbar on first frame — set WS_EX_TOOLWINDOW,
+        // clear WS_EX_APPWINDOW. Do this once; needs the window to exist first.
+        if !self.taskbar_hidden {
+            self.taskbar_hidden = true;
+            // Find HWND by window title
+            let title: Vec<u16> = ctx.input(|i| i.viewport().title.clone())
+                .unwrap_or_default()
+                .encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe {
+                let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+                if hwnd != 0 {
+                    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                    let ex = (ex & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW;
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+                    SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                }
+            }
+        }
+
+        // Minimize → hide window entirely (already not in taskbar)
         let is_minimized = ctx.input(|i| i.viewport().minimized == Some(true));
         if is_minimized {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
