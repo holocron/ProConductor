@@ -174,6 +174,10 @@ pub enum AppEvent {
     QuitApp,
 }
 
+/// Commands sent from main thread → tray background thread
+#[cfg(windows)]
+enum TrayCmd { SetIcon(u8) }  // 0=red 1=amber 2=green
+
 struct RunningProcess {
     pid:        u32,
     started_at: Instant,
@@ -298,7 +302,8 @@ struct ProConductor {
     // UI
     start_minimized: bool,   // send minimize command on first frame
     #[cfg(windows)]
-    _tray_icon: Option<TrayIcon>,  // system tray icon (Windows only, kept alive)
+    #[cfg(windows)]
+    tray_cmd_tx: Option<mpsc::Sender<TrayCmd>>,  // send icon-change cmds to tray thread
     #[cfg(windows)]
     tray_status: u8,               // 0=red 1=amber 2=green — track to avoid redundant swaps
     show_window_requested: bool,
@@ -360,34 +365,35 @@ impl ProConductor {
         // Open all groups initially
         let open_groups = config.groups.iter().map(|g| g.id.clone()).collect();
 
+        // tray-icon uses Rc internally — not Send — so the TrayIcon handle can never
+        // leave the thread it was built on. We keep it entirely inside the background
+        // thread and communicate via channels:
+        //   app → thread : TrayCmd  (icon colour changes)
+        //   thread → app : AppEvent (show/quit)
         #[cfg(windows)]
-        let tray_icon = {
-            // tray-icon creates a hidden Win32 window internally. The message pump
-            // (PeekMessage/DispatchMessage) MUST run on the same thread that called
-            // build(). So we create the tray AND pump messages on the background thread,
-            // sending the handle back via a one-shot channel.
-            let tx_tray   = tx.clone();
+        let tray_cmd_tx: Option<mpsc::Sender<TrayCmd>> = {
+            let tx_app    = tx.clone();
             let ctx_tray  = cc.egui_ctx.clone();
-            let (tray_tx, tray_rx) = mpsc::channel::<Option<TrayIcon>>();
+            let (cmd_tx, cmd_rx) = mpsc::channel::<TrayCmd>();
 
             thread::spawn(move || {
-                // Build tray on this thread
+                // Build tray on this thread — never send the handle anywhere
                 let icon = tray_icon::Icon::from_rgba(TRAY_ICON_RED.to_vec(), TRAY_ICON_W, TRAY_ICON_H)
                     .unwrap_or_else(|_| tray_icon::Icon::from_rgba(vec![240u8,74,94,255], 1, 1).unwrap());
                 let menu = Menu::new();
                 let _ = menu.append(&MenuItem::with_id("show", "Show", true, None));
                 let _ = menu.append(&MenuItem::with_id("quit", "Quit", true, None));
-                let tray = TrayIconBuilder::new()
+                let tray = match TrayIconBuilder::new()
                     .with_menu(Box::new(menu))
                     .with_tooltip("ProConductor")
                     .with_icon(icon)
-                    .build()
-                    .ok();
-                // Send handle to main thread — keep it alive here via _tray binding
-                let _ = tray_tx.send(tray);
+                    .build() {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
 
-                // Run message pump on this thread indefinitely
                 loop {
+                    // Must pump Win32 messages on the thread that built the tray window
                     unsafe {
                         let mut msg = MSG { hwnd:0, message:0, w:0, l:0, time:0, pt_x:0, pt_y:0 };
                         while PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) != 0 {
@@ -395,24 +401,37 @@ impl ProConductor {
                             DispatchMessageW(&msg);
                         }
                     }
-                    if let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                        if matches!(event, TrayIconEvent::Click { .. }) {
-                            let _ = tx_tray.send(AppEvent::ShowWindow);
+                    // Tray events → app
+                    if let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+                        if matches!(ev, TrayIconEvent::Click { .. }) {
+                            let _ = tx_app.send(AppEvent::ShowWindow);
                             ctx_tray.request_repaint();
                         }
                     }
-                    if let Ok(event) = MenuEvent::receiver().try_recv() {
-                        match event.id.0.as_str() {
-                            "show" => { let _ = tx_tray.send(AppEvent::ShowWindow); ctx_tray.request_repaint(); }
-                            _      => { let _ = tx_tray.send(AppEvent::QuitApp);    ctx_tray.request_repaint(); }
+                    if let Ok(ev) = MenuEvent::receiver().try_recv() {
+                        match ev.id.0.as_str() {
+                            "show" => { let _ = tx_app.send(AppEvent::ShowWindow); ctx_tray.request_repaint(); }
+                            _      => { let _ = tx_app.send(AppEvent::QuitApp);    ctx_tray.request_repaint(); }
+                        }
+                    }
+                    // Icon colour commands from app
+                    if let Ok(cmd) = cmd_rx.try_recv() {
+                        if let TrayCmd::SetIcon(status) = cmd {
+                            let rgba = match status {
+                                2 => TRAY_ICON_GREEN,
+                                1 => TRAY_ICON_AMBER,
+                                _ => TRAY_ICON_RED,
+                            };
+                            if let Ok(icon) = tray_icon::Icon::from_rgba(rgba.to_vec(), TRAY_ICON_W, TRAY_ICON_H) {
+                                let _ = tray.set_icon(Some(icon));
+                            }
                         }
                     }
                     thread::sleep(Duration::from_millis(50));
                 }
             });
 
-            // Receive handle back (tray is kept alive inside the thread)
-            tray_rx.recv().unwrap_or(None)
+            Some(cmd_tx)
         };
 
         let mut app = Self {
@@ -436,7 +455,7 @@ impl ProConductor {
             confirm_delete: None,
             start_minimized: minimized,
             #[cfg(windows)]
-            _tray_icon: tray_icon,
+            tray_cmd_tx: tray_cmd_tx,
             #[cfg(windows)]
             tray_status: 0,
             show_window_requested: false,
@@ -729,15 +748,8 @@ impl ProConductor {
                              else                            { 2 };
         if new_status != self.tray_status {
             self.tray_status = new_status;
-            if let Some(ref tray) = self._tray_icon {
-                let rgba = match new_status {
-                    2 => TRAY_ICON_GREEN,
-                    1 => TRAY_ICON_AMBER,
-                    _ => TRAY_ICON_RED,
-                };
-                if let Ok(icon) = tray_icon::Icon::from_rgba(rgba.to_vec(), TRAY_ICON_W, TRAY_ICON_H) {
-                    let _ = tray.set_icon(Some(icon));
-                }
+            if let Some(ref tx) = self.tray_cmd_tx {
+                let _ = tx.send(TrayCmd::SetIcon(new_status));
             }
         }
 
