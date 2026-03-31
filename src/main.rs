@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
-    TrayIcon, TrayIconBuilder, TrayIconEvent,
+    TrayIconBuilder, TrayIconEvent,
 };
 
 // Win32 FFI — taskbar removal + message pump for tray events
@@ -24,7 +24,11 @@ extern "system" {
     fn PeekMessageW(msg: *mut MSG, hwnd: isize, min: u32, max: u32, remove: u32) -> i32;
     fn TranslateMessage(msg: *const MSG) -> i32;
     fn DispatchMessageW(msg: *const MSG) -> isize;
+    fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+    fn SetForegroundWindow(hwnd: isize) -> i32;
 }
+#[cfg(windows)] const SW_HIDE:    i32 = 0;
+#[cfg(windows)] const SW_RESTORE: i32 = 9;
 #[cfg(windows)] const PM_REMOVE: u32 = 1;
 #[cfg(windows)] const GWL_EXSTYLE:      i32 = -20;
 #[cfg(windows)] const WS_EX_APPWINDOW:  isize = 0x00040000;
@@ -176,7 +180,10 @@ pub enum AppEvent {
 
 /// Commands sent from main thread → tray background thread
 #[cfg(windows)]
-enum TrayCmd { SetIcon(u8) }  // 0=red 1=amber 2=green
+enum TrayCmd {
+    SetIcon(u8),    // 0=red 1=amber 2=green
+    SetHwnd(isize), // share HWND so tray thread can call ShowWindow directly
+}
 
 struct RunningProcess {
     pid:        u32,
@@ -392,6 +399,7 @@ impl ProConductor {
                     Err(_) => return,
                 };
 
+                let mut hwnd: isize = 0;
                 loop {
                     // Must pump Win32 messages on the thread that built the tray window
                     unsafe {
@@ -401,29 +409,27 @@ impl ProConductor {
                             DispatchMessageW(&msg);
                         }
                     }
-                    // Tray events → app
+                    // Tray click / menu → act via Win32 directly, no egui needed
                     if let Ok(ev) = TrayIconEvent::receiver().try_recv() {
                         if matches!(ev, TrayIconEvent::Click { .. }) {
-                            let _ = tx_app.send(AppEvent::ShowWindow);
-                            ctx_tray.request_repaint();
+                            unsafe { ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); }
                         }
                     }
                     if let Ok(ev) = MenuEvent::receiver().try_recv() {
                         match ev.id.0.as_str() {
-                            "show" => { let _ = tx_app.send(AppEvent::ShowWindow); ctx_tray.request_repaint(); }
-                            _      => { let _ = tx_app.send(AppEvent::QuitApp);    ctx_tray.request_repaint(); }
+                            "show" => unsafe { ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); },
+                            _      => { let _ = tx_app.send(AppEvent::QuitApp); ctx_tray.request_repaint(); }
                         }
                     }
-                    // Icon colour commands from app
-                    if let Ok(cmd) = cmd_rx.try_recv() {
-                        if let TrayCmd::SetIcon(status) = cmd {
-                            let rgba = match status {
-                                2 => TRAY_ICON_GREEN,
-                                1 => TRAY_ICON_AMBER,
-                                _ => TRAY_ICON_RED,
-                            };
-                            if let Ok(icon) = tray_icon::Icon::from_rgba(rgba.to_vec(), TRAY_ICON_W, TRAY_ICON_H) {
-                                let _ = tray.set_icon(Some(icon));
+                    // Commands from app thread
+                    while let Ok(cmd) = cmd_rx.try_recv() {
+                        match cmd {
+                            TrayCmd::SetHwnd(h) => hwnd = h,
+                            TrayCmd::SetIcon(status) => {
+                                let rgba = match status { 2 => TRAY_ICON_GREEN, 1 => TRAY_ICON_AMBER, _ => TRAY_ICON_RED };
+                                if let Ok(icon) = tray_icon::Icon::from_rgba(rgba.to_vec(), TRAY_ICON_W, TRAY_ICON_H) {
+                                    let _ = tray.set_icon(Some(icon));
+                                }
                             }
                         }
                     }
@@ -705,13 +711,8 @@ impl eframe::App for ProConductor {
 
         self.drain_events();
 
-        // Handle tray-originated actions (set by background thread via channel)
-        if self.show_window_requested {
-            self.show_window_requested = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
+        // ShowWindow is now done directly via Win32 in the tray thread
+        self.show_window_requested = false;
         if self.quit_requested {
             self.stop_all();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -740,7 +741,7 @@ impl ProConductor {
 
     #[cfg(windows)]
     fn handle_tray(&mut self, ctx: &egui::Context) {
-        // Update tray icon color based on overall running status
+        // Update tray icon color
         let running = self.running_count();
         let total   = self.total_count();
         let new_status: u8 = if total == 0 || running == 0 { 0 }
@@ -753,30 +754,41 @@ impl ProConductor {
             }
         }
 
-        // Remove window from taskbar on first frame — set WS_EX_TOOLWINDOW,
-        // clear WS_EX_APPWINDOW. Do this once; needs the window to exist first.
+        // First frame: find HWND, remove from taskbar, share with tray thread
         if !self.taskbar_hidden {
             self.taskbar_hidden = true;
-            // Find HWND by window title
             let title: Vec<u16> = ctx.input(|i| i.viewport().title.clone())
                 .unwrap_or_default()
                 .encode_utf16().chain(std::iter::once(0)).collect();
             unsafe {
                 let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
                 if hwnd != 0 {
+                    // Remove from taskbar
                     let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
                     let ex = (ex & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW;
                     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
                     SetWindowPos(hwnd, 0, 0, 0, 0, 0,
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                    // Share HWND with tray thread — it will call ShowWindow directly
+                    if let Some(ref tx) = self.tray_cmd_tx {
+                        let _ = tx.send(TrayCmd::SetHwnd(hwnd));
+                    }
                 }
             }
         }
 
-        // Minimize → hide window entirely (already not in taskbar)
+        // Minimize → hide via Win32 (avoids Visible(false) killing the egui loop)
         let is_minimized = ctx.input(|i| i.viewport().minimized == Some(true));
         if is_minimized {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            let title: Vec<u16> = ctx.input(|i| i.viewport().title.clone())
+                .unwrap_or_default()
+                .encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe {
+                let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+                if hwnd != 0 { ShowWindow(hwnd, SW_HIDE); }
+            }
+            // Reset minimized state in egui so it doesn't keep firing
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         }
     }
 
