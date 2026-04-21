@@ -486,6 +486,7 @@ impl ProConductor {
     fn start(&mut self, comp: &Component) {
         if self.running.contains_key(&comp.id) { return; }
 
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut args = split_args(&comp.args);
 
         // sudo -u <user> on Unix
@@ -727,7 +728,7 @@ struct HSpan { start: usize, end: usize, color: Color32, bold: bool, priority: u
 const HL_NUMBER:  Color32 = Color32::from_rgb( 86, 210, 255);  // cyan
 const HL_STRING:  Color32 = Color32::from_rgb(152, 220,  90);  // green
 const HL_URL:     Color32 = Color32::from_rgb( 86, 180, 255);  // light blue
-const HL_KEY:     Color32 = Color32::from_rgb(140, 170, 220);  // steel blue
+const _HL_KEY:    Color32 = Color32::from_rgb(140, 170, 220);  // steel blue
 const HL_UUID:    Color32 = Color32::from_rgb(190, 140, 255);  // purple
 const HL_IP:      Color32 = Color32::from_rgb(240, 175,  60);  // amber
 const HL_PATH:    Color32 = Color32::from_rgb(170, 170, 170);  // grey
@@ -1001,7 +1002,7 @@ fn highlight_log_line(
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = f32::INFINITY; // no word wrap — horizontal scroll handles it
 
-    let plain_fmt = |color: Color32, bold: bool| egui::text::TextFormat {
+    let plain_fmt = |color: Color32, _bold: bool| egui::text::TextFormat {
         font_id: font_id.clone(),
         color,
         background: Color32::TRANSPARENT,
