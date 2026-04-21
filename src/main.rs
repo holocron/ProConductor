@@ -98,7 +98,6 @@ const BLUE_DIM:   Color32 = Color32::from_rgb( 18,  32, 100);
 // Log syntax highlighting — span-based pipeline (inspired by tailspin)
 // ══════════════════════════════════════════════════════════════════════════════
 
-#[derive(Clone)]
 // ══════════════════════════════════════════════════════════════════════════════
 // Config — lives in the .json file the user passes
 // ══════════════════════════════════════════════════════════════════════════════
