@@ -1734,6 +1734,10 @@ impl ProConductor {
             .stick_to_bottom(self.log_autoscroll)
             .auto_shrink([false; 2])
             .show(ui, |ui| {
+                // Allow content to be wider than the viewport so horizontal scroll works.
+                // Without this egui clips every row to available_width.
+                ui.set_min_width(ui.available_width().max(4096.0));
+                ui.style_mut().wrap = Some(false);
                 for line in &logs {
                     if !filter.is_empty() && !line.text.to_lowercase().contains(&filter.to_lowercase()) {
                         continue;
