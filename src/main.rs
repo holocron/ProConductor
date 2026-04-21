@@ -1752,18 +1752,48 @@ impl ProConductor {
 
                     let base_color = if is_real_error { Color32::from_rgb(240, 120, 130) } else { TEXT_PRI };
 
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.label(RichText::new(&line.time).size(10.5).color(TEXT_DIM).monospace());
-                        let (src_text, src_color) = match line.source {
-                            Source::Stdout => ("OUT", BLUE),
-                            Source::Stderr => if is_real_error { ("ERR", RED) } else { ("ERR", TEXT_MUTED) },
-                            Source::System => ("SYS", AMBER),
-                        };
-                        ui.label(RichText::new(src_text).size(10.0).color(src_color).monospace().strong());
-                        let job = highlight_log_line(&line.text, base_color, &font_id);
-                        ui.label(job);
-                    });
+                    // Render the entire line as ONE LayoutJob — timestamp + source tag + text.
+                    // Using ui.horizontal() splits the row into multiple widgets; egui clips
+                    // each to available_width so the scrollbar never has anything to scroll.
+                    // A single label with a composite job extends as far as the text needs.
+                    let dim_fmt   = egui::text::TextFormat { font_id: font_id.clone(), color: TEXT_DIM,  ..Default::default() };
+                    let space_fmt = egui::text::TextFormat { font_id: font_id.clone(), color: TEXT_DIM,  ..Default::default() };
+                    let src_color = match line.source {
+                        Source::Stdout => BLUE,
+                        Source::Stderr => if is_real_error { RED } else { TEXT_MUTED },
+                        Source::System => AMBER,
+                    };
+                    let src_text = match line.source {
+                        Source::Stdout => "OUT",
+                        Source::Stderr => "ERR",
+                        Source::System => "SYS",
+                    };
+                    let src_fmt = egui::text::TextFormat {
+                        font_id: font_id.clone(), color: src_color,
+                        ..Default::default()
+                    };
+
+                    let mut job = highlight_log_line(&line.text, base_color, &font_id);
+                    // Prepend timestamp and source tag into the same job
+                    let text_part = std::mem::take(&mut job.text);
+                    let sections  = std::mem::take(&mut job.sections);
+                    let prefix    = format!("{}  {} ", line.time, src_text);
+                    let mut full_job = egui::text::LayoutJob::default();
+                    full_job.wrap.max_width = f32::INFINITY;
+                    full_job.append(&line.time, 0.0, dim_fmt);
+                    full_job.append("  ", 0.0, space_fmt.clone());
+                    full_job.append(src_text, 0.0, src_fmt);
+                    full_job.append(" ", 0.0, space_fmt);
+                    // Re-add the highlighted text sections
+                    let offset = full_job.text.len();
+                    full_job.text.push_str(&text_part);
+                    for mut s in sections {
+                        s.byte_range.start += offset;
+                        s.byte_range.end   += offset;
+                        full_job.sections.push(s);
+                    }
+                    let _ = prefix; // suppress unused warning
+                    ui.label(full_job);
                 }
                 if logs.is_empty() {
                     ui.vertical_centered(|ui| {
