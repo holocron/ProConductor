@@ -1237,6 +1237,38 @@ impl ProConductor {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(4.0);
 
+                        // ── Window controls (Windows custom titlebar only) ─────
+                        #[cfg(windows)]
+                        {
+                            // Close
+                            let close_r = ui.add(egui::Button::new(
+                                RichText::new("✕").size(13.0).color(TEXT_SEC))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE)
+                                .min_size(Vec2::new(36.0, 36.0)));
+                            if close_r.hovered() {
+                                ui.painter().rect_filled(close_r.rect, 0.0, RED_BG);
+                            }
+                            if close_r.clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+
+                            // Minimize
+                            let min_r = ui.add(egui::Button::new(
+                                RichText::new("─").size(13.0).color(TEXT_SEC))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE)
+                                .min_size(Vec2::new(36.0, 36.0)));
+                            if min_r.hovered() {
+                                ui.painter().rect_filled(min_r.rect, 0.0, BG_HOVER);
+                            }
+                            if min_r.clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                            }
+
+                            ui.add_space(8.0);
+                        }
+
                         // Stop All
                         let stopped = self.running_count() == 0;
                         let stop_btn = egui::Button::new(
@@ -1286,6 +1318,19 @@ impl ProConductor {
                         }
                     });
                 });
+
+                // Drag the window by clicking empty topbar space (Windows custom titlebar)
+                #[cfg(windows)]
+                {
+                    let topbar_resp = ui.interact(
+                        ui.min_rect(),
+                        ui.id().with("topbar_drag"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if topbar_resp.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                }
             });
     }
 
@@ -2273,6 +2318,8 @@ Close that window first.", name);
             .with_title(&title)
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 580.0])
+            // Windows: remove native title bar — we draw our own in render_topbar
+            .with_decorations(!cfg!(windows))
             .with_icon(eframe::icon_data::from_png_bytes(&[]).unwrap_or_default()),
         ..Default::default()
     };
