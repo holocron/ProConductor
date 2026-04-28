@@ -542,6 +542,8 @@ impl ProConductor {
 
     fn start(&mut self, comp: &Component) {
         if self.running.contains_key(&comp.id) { return; }
+        // Clear any stale stopping entry — user clicked Start before grace period ended
+        self.stopping.remove(&comp.id);
 
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut args = split_args(&comp.args);
@@ -708,9 +710,12 @@ impl ProConductor {
             let id_owned  = id.to_string();
             thread::spawn(move || {
                 kill_tree(pid);
-                if let Ok(mut c) = child_arc.lock() { let _ = c.kill(); }
+                // Send Stopped immediately after kill_tree — do NOT try to acquire
+                // child_arc lock here as the monitor thread may hold it and cause delay
                 let _ = tx.send(AppEvent::Stopped { id: id_owned });
                 ctx.request_repaint();
+                // Belt-and-suspenders kill via child handle (non-blocking attempt)
+                if let Ok(mut c) = child_arc.try_lock() { let _ = c.kill(); }
             });
         }
     }
