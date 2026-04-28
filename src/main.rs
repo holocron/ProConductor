@@ -277,43 +277,38 @@ extern "system" {
     fn TerminateProcess(handle: isize, code: u32) -> i32;
     fn CloseHandle(handle: isize) -> i32;
     fn WaitForSingleObject(handle: isize, ms: u32) -> u32;
-    fn GenerateConsoleCtrlEvent(event: u32, pid: u32) -> i32;
-    fn AttachConsole(pid: u32) -> i32;
-    fn FreeConsole() -> i32;
 }
-#[cfg(windows)] const PROCESS_TERMINATE:        u32 = 0x0001;
-#[cfg(windows)] const PROCESS_SYNCHRONIZE:      u32 = 0x00100000;
-#[cfg(windows)] const CTRL_BREAK_EVENT:         u32 = 1;
-#[cfg(windows)] const WAIT_TIMEOUT:             u32 = 0x00000102;
-#[cfg(windows)] const GRACE_PERIOD_MS:          u32 = 8000; // 8 s before force-kill
+#[cfg(windows)] const PROCESS_TERMINATE:    u32 = 0x0001;
+#[cfg(windows)] const PROCESS_SYNCHRONIZE:  u32 = 0x00100000;
+#[cfg(windows)] const WAIT_TIMEOUT:         u32 = 0x00000102;
+#[cfg(windows)] const GRACE_PERIOD_MS:      u32 = 8000;
 
 #[cfg(windows)]
 fn kill_tree(pid: u32) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    // Step 1: Send Ctrl+Break — this is the Windows equivalent of SIGTERM.
-    // The process must have been started in its own console group (CREATE_NEW_PROCESS_GROUP)
-    // for this to work cleanly. Attach to its console temporarily to send the event.
-    unsafe {
-        FreeConsole();                        // detach from our own console (if any)
-        if AttachConsole(pid) != 0 {
-            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
-            FreeConsole();
-        }
-    }
+    // Step 1: Ask the process tree to shut down gracefully via taskkill WITHOUT /F.
+    // This sends WM_CLOSE to all windows and Ctrl+Break to console processes in the tree.
+    // We use .spawn() so this returns immediately — we wait separately below.
+    // IMPORTANT: Never call FreeConsole()/AttachConsole() from our process —
+    // that invalidates our own stdio handles causing ERROR_INVALID_HANDLE (os error 6)
+    // on the next process spawn.
+    let _ = Command::new("taskkill")
+        .args(["/T", "/PID", &pid.to_string()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
 
-    // Step 2: Wait up to GRACE_PERIOD_MS for the process to exit cleanly.
-    // We do this on the calling thread — it's already a background thread (see stop()).
+    // Step 2: Wait up to GRACE_PERIOD_MS for the main process to exit.
     let exited_cleanly = unsafe {
         let h = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid);
         if h == 0 {
-            true // process already gone
+            true // already gone
         } else {
             let result = WaitForSingleObject(h, GRACE_PERIOD_MS);
             let clean  = result != WAIT_TIMEOUT;
             if !clean {
-                // Step 3: Grace period expired — force-kill the whole tree
+                // Step 3: Grace period expired — force kill
                 TerminateProcess(h, 1);
                 let _ = Command::new("taskkill")
                     .args(["/F", "/T", "/PID", &pid.to_string()])
@@ -324,7 +319,7 @@ fn kill_tree(pid: u32) {
             clean
         }
     };
-    let _ = exited_cleanly; // available for logging if needed
+    let _ = exited_cleanly;
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -577,13 +572,11 @@ impl ProConductor {
         // Unix: new process group for clean tree-kill
         #[cfg(unix)] { use std::os::unix::process::CommandExt; cmd.process_group(0); }
 
-        // Windows: hide child console window, but give it its own console group
-        // so GenerateConsoleCtrlEvent(CTRL_BREAK) can reach it for graceful shutdown.
+        // Windows: hide child console windows — stdout/stderr captured via pipes
         #[cfg(windows)] {
             use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW:       u32 = 0x08000000;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
         let child = match cmd.spawn() {
