@@ -275,23 +275,55 @@ extern "system" {
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
     fn TerminateProcess(handle: isize, code: u32) -> i32;
     fn CloseHandle(handle: isize) -> i32;
+    fn WaitForSingleObject(handle: isize, ms: u32) -> u32;
+    fn GenerateConsoleCtrlEvent(event: u32, pid: u32) -> i32;
+    fn AttachConsole(pid: u32) -> i32;
+    fn FreeConsole() -> i32;
 }
-#[cfg(windows)] const PROCESS_TERMINATE: u32 = 0x0001;
+#[cfg(windows)] const PROCESS_TERMINATE:        u32 = 0x0001;
+#[cfg(windows)] const PROCESS_SYNCHRONIZE:      u32 = 0x00100000;
+#[cfg(windows)] const CTRL_BREAK_EVENT:         u32 = 1;
+#[cfg(windows)] const WAIT_TIMEOUT:             u32 = 0x00000102;
+#[cfg(windows)] const GRACE_PERIOD_MS:          u32 = 8000; // 8 s before force-kill
 
 #[cfg(windows)]
 fn kill_tree(pid: u32) {
-    // TerminateProcess is instant — no waiting for taskkill.exe to start/finish
-    unsafe {
-        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if h != 0 { TerminateProcess(h, 1); CloseHandle(h); }
-    }
-    // Also fire taskkill for child processes — spawn() returns immediately, don't wait
-    #[allow(unused_imports)]
     use std::os::windows::process::CommandExt;
-    let _ = Command::new("taskkill")
-        .args(["/F", "/T", "/PID", &pid.to_string()])
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .spawn();
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    // Step 1: Send Ctrl+Break — this is the Windows equivalent of SIGTERM.
+    // The process must have been started in its own console group (CREATE_NEW_PROCESS_GROUP)
+    // for this to work cleanly. Attach to its console temporarily to send the event.
+    unsafe {
+        FreeConsole();                        // detach from our own console (if any)
+        if AttachConsole(pid) != 0 {
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
+            FreeConsole();
+        }
+    }
+
+    // Step 2: Wait up to GRACE_PERIOD_MS for the process to exit cleanly.
+    // We do this on the calling thread — it's already a background thread (see stop()).
+    let exited_cleanly = unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid);
+        if h == 0 {
+            true // process already gone
+        } else {
+            let result = WaitForSingleObject(h, GRACE_PERIOD_MS);
+            let clean  = result != WAIT_TIMEOUT;
+            if !clean {
+                // Step 3: Grace period expired — force-kill the whole tree
+                TerminateProcess(h, 1);
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn();
+            }
+            CloseHandle(h);
+            clean
+        }
+    };
+    let _ = exited_cleanly; // available for logging if needed
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -542,11 +574,13 @@ impl ProConductor {
         // Unix: new process group for clean tree-kill
         #[cfg(unix)] { use std::os::unix::process::CommandExt; cmd.process_group(0); }
 
-        // Windows: hide child console windows — stdout/stderr captured via pipes
+        // Windows: hide child console window, but give it its own console group
+        // so GenerateConsoleCtrlEvent(CTRL_BREAK) can reach it for graceful shutdown.
         #[cfg(windows)] {
             use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            const CREATE_NO_WINDOW:       u32 = 0x08000000;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
         }
 
         let child = match cmd.spawn() {
