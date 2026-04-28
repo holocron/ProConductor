@@ -1251,8 +1251,7 @@ impl ProConductor {
                         #[cfg(windows)]
                         {
                             let close_resp = ui.add(
-                                egui::Button::new(RichText::new("X").size(12.0)
-                                    .color(if ui.rect_contains_pointer(ui.next_widget_position().into()) { Color32::WHITE } else { TEXT_SEC }))
+                                egui::Button::new(RichText::new("X").size(12.0).color(TEXT_SEC))
                                     .fill(Color32::TRANSPARENT)
                                     .stroke(Stroke::NONE)
                                     .min_size(Vec2::new(40.0, 40.0))
