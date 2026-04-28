@@ -1140,6 +1140,7 @@ impl eframe::App for ProConductor {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
         self.render_topbar(ctx);
+        #[cfg(windows)] self.render_window_controls(ctx);
         self.render_sidebar(ctx);
         self.render_main(ctx);
         self.render_confirm_dialog(ctx);
@@ -1247,37 +1248,8 @@ impl ProConductor {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.add_space(4.0);
 
-                        // ── Window controls (Windows custom titlebar only) ─────
-                        #[cfg(windows)]
-                        {
-                            let close_resp = ui.add(
-                                egui::Button::new(RichText::new("X").size(12.0).color(TEXT_SEC))
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::NONE)
-                                    .min_size(Vec2::new(40.0, 40.0))
-                            );
-                            if close_resp.hovered() {
-                                ui.painter().rect_filled(close_resp.rect, 0.0, RED_DIM);
-                            }
-                            if close_resp.clicked() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
-
-                            let min_resp = ui.add(
-                                egui::Button::new(RichText::new("_").size(12.0).color(TEXT_SEC))
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::NONE)
-                                    .min_size(Vec2::new(40.0, 40.0))
-                            );
-                            if min_resp.hovered() {
-                                ui.painter().rect_filled(min_resp.rect, 0.0, BG_HOVER);
-                            }
-                            if min_resp.clicked() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                            }
-
-                            ui.add_space(4.0);
-                        }
+                        // Reserve space so the right-side buttons don't overlap the window controls
+                        #[cfg(windows)] { ui.add_space(88.0); }
 
                         // Stop All
                         let stopped = self.running_count() == 0;
@@ -1329,8 +1301,8 @@ impl ProConductor {
                     });
                 });
 
-                // Drag the window by dragging empty topbar space (Windows custom titlebar).
-                // Use Sense::drag() only — NOT click_and_drag — so button clicks aren't stolen.
+                // Drag by dragging empty topbar space.
+                // Area::Foreground for window controls takes priority so no conflict.
                 #[cfg(windows)]
                 {
                     let topbar_resp = ui.interact(
@@ -1342,6 +1314,48 @@ impl ProConductor {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
                 }
+            });
+    }
+
+    // ── Window controls overlay (Windows only) ────────────────────────────
+
+    #[cfg(windows)]
+    fn render_window_controls(&self, ctx: &egui::Context) {
+        // Render close and minimize as a floating Area pinned to top-right.
+        // This avoids right-to-left layout distorting the hit rects.
+        let screen_w = ctx.screen_rect().width();
+        egui::Area::new(egui::Id::new("win_controls"))
+            .fixed_pos(egui::pos2(screen_w - 84.0, 4.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+
+                    // Minimize
+                    let min = ui.add(
+                        egui::Button::new(RichText::new("  _  ").size(12.0).color(TEXT_SEC))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE)
+                            .min_size(Vec2::new(40.0, 40.0))
+                    );
+                    if min.hovered() { ui.painter().rect_filled(min.rect, 2.0, BG_HOVER); }
+                    if min.clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)); }
+
+                    // Close
+                    let close = ui.add(
+                        egui::Button::new(RichText::new("  X  ").size(12.0).color(TEXT_SEC))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE)
+                            .min_size(Vec2::new(40.0, 40.0))
+                    );
+                    if close.hovered() {
+                        ui.painter().rect_filled(close.rect, 2.0, RED_DIM);
+                        // Redraw text on top of highlight so it stays visible
+                        ui.painter().text(close.rect.center(), egui::Align2::CENTER_CENTER,
+                            "X", egui::FontId::proportional(12.0), TEXT_PRI);
+                    }
+                    if close.clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+                });
             });
     }
 
