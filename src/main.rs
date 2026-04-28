@@ -91,6 +91,8 @@ const RED:        Color32 = Color32::from_rgb(240,  74,  94);
 const RED_DIM:    Color32 = Color32::from_rgb( 74,  15,  22);
 const RED_BG:     Color32 = Color32::from_rgb( 30,   6,  10);
 const AMBER:      Color32 = Color32::from_rgb(240, 160,  48);
+const AMBER_DIM:  Color32 = Color32::from_rgb( 74,  48,  10);
+const AMBER_BG:   Color32 = Color32::from_rgb( 30,  20,   7);
 const BLUE:       Color32 = Color32::from_rgb( 68, 136, 255);
 const BLUE_DIM:   Color32 = Color32::from_rgb( 18,  32, 100);
 
@@ -178,6 +180,7 @@ pub struct LogLine {
 pub enum AppEvent {
     Log         { id: String, line: LogLine },
     Status      { id: String, running: bool, pid: Option<u32>, exit_code: Option<i32> },
+    Stopped     { id: String },
     ShowWindow,
     QuitApp,
 }
@@ -305,6 +308,7 @@ struct ProConductor {
 
     // Runtime
     running:    HashMap<String, RunningProcess>,
+    stopping:   HashSet<String>,
     logs:       HashMap<String, Vec<LogLine>>,
     event_tx:   mpsc::Sender<AppEvent>,
     event_rx:   mpsc::Receiver<AppEvent>,
@@ -453,6 +457,7 @@ impl ProConductor {
             _lock: lock,
             pid_registry,
             running: HashMap::new(),
+            stopping: HashSet::new(),
             logs: HashMap::new(),
             event_tx: tx,
             event_rx: rx,
@@ -626,15 +631,23 @@ impl ProConductor {
 
     fn stop(&mut self, id: &str) {
         if let Some(handle) = self.running.remove(id) {
-            kill_tree(handle.pid);
-            // child.kill() as fallback
-            if let Ok(mut c) = handle.child.lock() { let _ = c.kill(); }
-            // Unregister from signal handler registry
+            self.stopping.insert(id.to_string());
             self.pid_registry.lock().unwrap().retain(|&p| p != handle.pid);
             self.logs.entry(id.to_string()).or_default().push(LogLine {
-                time: now_hms(), source: Source::System, text: "Stop requested".into(),
+                time: now_hms(), source: Source::System, text: "Stop requested…".into(),
             });
             self.ctx_handle.request_repaint();
+            let pid       = handle.pid;
+            let child_arc = handle.child.clone();
+            let ctx       = self.ctx_handle.clone();
+            let tx        = self.event_tx.clone();
+            let id_owned  = id.to_string();
+            thread::spawn(move || {
+                kill_tree(pid);
+                if let Ok(mut c) = child_arc.lock() { let _ = c.kill(); }
+                let _ = tx.send(AppEvent::Stopped { id: id_owned });
+                ctx.request_repaint();
+            });
         }
     }
 
@@ -690,8 +703,12 @@ impl ProConductor {
                     if buf.len() > 5000 { buf.drain(..500); }
                 }
                 AppEvent::Status { id, running, .. } => {
-                    if !running { self.running.remove(&id); }
+                    if !running {
+                        self.running.remove(&id);
+                        self.stopping.remove(&id);
+                    }
                 }
+                AppEvent::Stopped { id } => { self.stopping.remove(&id); }
                 AppEvent::ShowWindow => { self.show_window_requested = true; }
                 AppEvent::QuitApp    => { self.quit_requested        = true; }
             }
@@ -1519,9 +1536,10 @@ impl ProConductor {
             Some(c) => c, None => return,
         };
         let is_running   = self.running.contains_key(cid);
+        let is_stopping  = self.stopping.contains(cid);
         let handle_info  = self.running.get(cid).map(|h| (h.pid, h.started_at));
         let is_sel       = self.selected_comp.as_deref() == Some(cid);
-        let border_color = if is_running { GREEN_DIM } else { BORDER };
+        let border_color = if is_stopping { AMBER_DIM } else if is_running { GREEN_DIM } else { BORDER };
         let bg           = if is_sel { BG_SEL } else { BG_CARD };
 
         let mut do_start     = false;
@@ -1551,9 +1569,12 @@ impl ProConductor {
                     // LEFT: status dot + name/meta — does NOT use remaining width greedy
                     let (r, painter) = ui.allocate_painter(Vec2::splat(12.0), egui::Sense::hover());
                     let center = r.rect.center();
-                    painter.circle_filled(center, 5.0, if is_running { GREEN } else { TEXT_DIM });
-                    if is_running {
-                        painter.circle_stroke(center, 7.0, Stroke::new(1.0, Color32::from_rgba_premultiplied(33,212,126,60)));
+                    let dot_color = if is_stopping { AMBER } else if is_running { GREEN } else { TEXT_DIM };
+                    painter.circle_filled(center, 5.0, dot_color);
+                    if is_running || is_stopping {
+                        let glow = if is_stopping { Color32::from_rgba_premultiplied(240,160,48,60) }
+                                   else           { Color32::from_rgba_premultiplied(33,212,126,60) };
+                        painter.circle_stroke(center, 7.0, Stroke::new(1.0, glow));
                     }
 
                     // Name/meta column with explicit max width so buttons get space
@@ -1562,7 +1583,14 @@ impl ProConductor {
                         ui.vertical(|ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new(&comp.name).size(13.0).strong().color(TEXT_PRI));
-                                if is_running {
+                                if is_stopping {
+                                    egui::Frame::none().fill(AMBER_BG).rounding(4.0)
+                                        .stroke(Stroke::new(1.0, AMBER_DIM))
+                                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                        .show(ui, |ui| {
+                                            ui.label(RichText::new("STOPPING…").size(9.0).color(AMBER).strong());
+                                        });
+                                } else if is_running {
                                     egui::Frame::none().fill(GREEN_BG).rounding(4.0)
                                         .stroke(Stroke::new(1.0, GREEN_DIM))
                                         .inner_margin(egui::Margin::symmetric(6.0, 2.0))
@@ -1635,7 +1663,11 @@ impl ProConductor {
                             .on_hover_text("View live log output").clicked() { do_log = true; }
 
                         // Start / Stop
-                        if is_running {
+                        if is_stopping {
+                            ui.add_enabled(false, egui::Button::new(
+                                RichText::new("Stopping…").size(11.0).color(AMBER))
+                                .fill(AMBER_BG).stroke(Stroke::new(1.0, AMBER_DIM)));
+                        } else if is_running {
                             if ui.add(egui::Button::new(RichText::new("Stop").size(11.0).color(RED))
                                 .fill(RED_BG).stroke(Stroke::new(1.0, RED_DIM))).clicked() { do_stop = true; }
                         } else {
