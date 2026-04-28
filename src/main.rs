@@ -359,7 +359,7 @@ struct ProConductor {
 
     // Runtime
     running:    HashMap<String, RunningProcess>,
-    stopping:   HashSet<String>,
+    stopping:   HashMap<String, Instant>,   // id → when stop was requested
     logs:       HashMap<String, Vec<LogLine>>,
     event_tx:   mpsc::Sender<AppEvent>,
     event_rx:   mpsc::Receiver<AppEvent>,
@@ -508,7 +508,7 @@ impl ProConductor {
             _lock: lock,
             pid_registry,
             running: HashMap::new(),
-            stopping: HashSet::new(),
+            stopping: HashMap::new(),
             logs: HashMap::new(),
             event_tx: tx,
             event_rx: rx,
@@ -684,7 +684,7 @@ impl ProConductor {
 
     fn stop(&mut self, id: &str) {
         if let Some(handle) = self.running.remove(id) {
-            self.stopping.insert(id.to_string());
+            self.stopping.insert(id.to_string(), Instant::now());
             self.pid_registry.lock().unwrap().retain(|&p| p != handle.pid);
             self.logs.entry(id.to_string()).or_default().push(LogLine {
                 time: now_hms(), source: Source::System, text: "Stop requested…".into(),
@@ -1123,7 +1123,12 @@ impl eframe::App for ProConductor {
         // Windows tray: update icon color, hide window on minimize
         #[cfg(windows)]
         self.handle_tray(ctx);
-        ctx.request_repaint_after(Duration::from_secs(1));
+        // Faster repaint while any process is stopping (progress bar needs it)
+        if !self.stopping.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        } else {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
         self.render_topbar(ctx);
         self.render_sidebar(ctx);
         self.render_main(ctx);
@@ -1589,7 +1594,8 @@ impl ProConductor {
             Some(c) => c, None => return,
         };
         let is_running   = self.running.contains_key(cid);
-        let is_stopping  = self.stopping.contains(cid);
+        let is_stopping  = self.stopping.contains_key(cid);
+        let stop_started = self.stopping.get(cid).copied();
         let handle_info  = self.running.get(cid).map(|h| (h.pid, h.started_at));
         let is_sel       = self.selected_comp.as_deref() == Some(cid);
         let border_color = if is_stopping { AMBER_DIM } else if is_running { GREEN_DIM } else { BORDER };
@@ -1637,11 +1643,25 @@ impl ProConductor {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new(&comp.name).size(13.0).strong().color(TEXT_PRI));
                                 if is_stopping {
+                                    let elapsed = stop_started.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
+                                    let progress = (elapsed / 8.0).min(1.0);
                                     egui::Frame::none().fill(AMBER_BG).rounding(4.0)
                                         .stroke(Stroke::new(1.0, AMBER_DIM))
                                         .inner_margin(egui::Margin::symmetric(6.0, 2.0))
                                         .show(ui, |ui| {
-                                            ui.label(RichText::new("STOPPING…").size(9.0).color(AMBER).strong());
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new("Stopping").size(9.0).color(AMBER).strong());
+                                                // Progress bar
+                                                let (bar_rect, _) = ui.allocate_exact_size(
+                                                    Vec2::new(48.0, 5.0), egui::Sense::hover());
+                                                let painter = ui.painter();
+                                                painter.rect_filled(bar_rect, 2.0, AMBER_DIM);
+                                                let mut fill = bar_rect;
+                                                fill.set_right(bar_rect.left() + bar_rect.width() * progress);
+                                                painter.rect_filled(fill, 2.0, AMBER);
+                                                let secs_left = (8.0 - elapsed).max(0.0).ceil() as u32;
+                                                ui.label(RichText::new(format!("{}s", secs_left)).size(9.0).color(AMBER_DIM));
+                                            });
                                         });
                                 } else if is_running {
                                     egui::Frame::none().fill(GREEN_BG).rounding(4.0)
