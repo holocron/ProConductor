@@ -1140,6 +1140,7 @@ impl eframe::App for ProConductor {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
         self.render_topbar(ctx);
+        self.render_topbar_controls(ctx);
         #[cfg(windows)] self.render_window_controls(ctx);
         self.render_sidebar(ctx);
         self.render_main(ctx);
@@ -1245,60 +1246,8 @@ impl ProConductor {
                         ui.label(RichText::new("●").color(AMBER).size(10.0));
                     }
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_space(4.0);
-
-                        // Reserve space so the right-side buttons don't overlap the window controls
-                        #[cfg(windows)] { ui.add_space(88.0); }
-
-                        // Stop All
-                        let stopped = self.running_count() == 0;
-                        let stop_btn = egui::Button::new(
-                            RichText::new("■  Stop All").size(12.0).color(if stopped { RED_DIM } else { RED })
-                        ).fill(RED_BG).stroke(Stroke::new(1.0, if stopped { RED_DIM } else { RED }));
-                        if ui.add_enabled(!stopped, stop_btn).clicked() { self.stop_all(); }
-
-                        ui.add_space(6.0);
-
-                        // Start All
-                        let all_running = self.running_count() == self.total_count() && self.total_count() > 0;
-                        let start_btn = egui::Button::new(
-                            RichText::new("▶  Start All").size(12.0).color(if all_running { GREEN_DIM } else { GREEN })
-                        ).fill(GREEN_BG).stroke(Stroke::new(1.0, if all_running { GREEN_DIM } else { GREEN }));
-                        if ui.add_enabled(!all_running && self.total_count() > 0, start_btn).clicked() {
-                            self.start_all();
-                        }
-
-                        ui.add_space(10.0);
-
-                        // Status pill
-                        let run = self.running_count();
-                        let tot = self.total_count();
-                        egui::Frame::none()
-                            .fill(BG_CARD)
-                            .rounding(12.0)
-                            .stroke(Stroke::new(1.0, BORDER))
-                            .inner_margin(egui::Margin::symmetric(10.0, 4.0))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("●").color(GREEN).size(9.0));
-                                    ui.label(RichText::new(format!("{}", run)).size(11.0).color(TEXT_PRI));
-                                    ui.label(RichText::new("/").size(11.0).color(TEXT_DIM));
-                                    ui.label(RichText::new(format!("{}", tot)).size(11.0).color(TEXT_MUTED));
-                                });
-                            });
-
-                        // Save
-                        if self.dirty {
-                            let save_btn = egui::Button::new(
-                                RichText::new("💾 Save").size(11.0).color(AMBER)
-                            ).fill(Color32::from_rgb(30, 20, 7)).stroke(Stroke::new(1.0, Color32::from_rgb(74, 48, 10)));
-                            if ui.add(save_btn).clicked() {
-                                save_config(&self.config, &self.config_path);
-                                self.dirty = false;
-                            }
-                        }
-                    });
+                    // Right-side controls are rendered as a floating Area in render_topbar_controls()
+                    // to avoid right-to-left layout distorting hit rects.
                 });
 
                 // Drag by dragging empty topbar space.
@@ -1314,6 +1263,72 @@ impl ProConductor {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
                 }
+            });
+    }
+
+    // ── Topbar right-side controls ────────────────────────────────────────
+
+    fn render_topbar_controls(&mut self, ctx: &egui::Context) {
+        let screen_w = ctx.screen_rect().width();
+        // Reserve room for window controls on Windows
+        let right_margin: f32 = if cfg!(windows) { 92.0 } else { 8.0 };
+        // Estimate content width: Save(80) + pill(60) + gap + StartAll(110) + gap + StopAll(110)
+        let area_w = 420.0_f32;
+        let x = screen_w - right_margin - area_w;
+
+        egui::Area::new(egui::Id::new("topbar_controls"))
+            .fixed_pos(egui::pos2(x, 0.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_height(48.0);
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+
+                    // Save button
+                    if self.dirty {
+                        let save_btn = egui::Button::new(
+                            RichText::new("💾 Save").size(11.0).color(AMBER)
+                        ).fill(Color32::from_rgb(30,20,7)).stroke(Stroke::new(1.0, Color32::from_rgb(74,48,10)));
+                        if ui.add(save_btn).clicked() {
+                            save_config(&self.config, &self.config_path);
+                            self.dirty = false;
+                        }
+                    }
+
+                    // Status pill
+                    let run = self.running_count();
+                    let tot = self.total_count();
+                    egui::Frame::none()
+                        .fill(BG_CARD).rounding(12.0)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("●").color(GREEN).size(9.0));
+                                ui.label(RichText::new(format!("{}", run)).size(11.0).color(TEXT_PRI));
+                                ui.label(RichText::new("/").size(11.0).color(TEXT_DIM));
+                                ui.label(RichText::new(format!("{}", tot)).size(11.0).color(TEXT_MUTED));
+                            });
+                        });
+
+                    // Start All
+                    let all_running = run == tot && tot > 0;
+                    let start_btn = egui::Button::new(
+                        RichText::new("▶  Start All").size(12.0).color(if all_running { GREEN_DIM } else { GREEN })
+                    ).fill(GREEN_BG).stroke(Stroke::new(1.0, if all_running { GREEN_DIM } else { GREEN }));
+                    if ui.add_enabled(!all_running && tot > 0, start_btn).clicked() {
+                        self.start_all();
+                    }
+
+                    // Stop All
+                    let all_stopped = run == 0;
+                    let stop_btn = egui::Button::new(
+                        RichText::new("■  Stop All").size(12.0).color(if all_stopped { RED_DIM } else { RED })
+                    ).fill(RED_BG).stroke(Stroke::new(1.0, if all_stopped { RED_DIM } else { RED }));
+                    if ui.add_enabled(!all_stopped, stop_btn).clicked() {
+                        self.stop_all();
+                    }
+                });
             });
     }
 
