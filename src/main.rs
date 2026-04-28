@@ -602,6 +602,8 @@ impl ProConductor {
             })
             .map(|f| Arc::new(Mutex::new(f)));
 
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // ── Stdout thread
         let stdout = child_arc.lock().unwrap().stdout.take().unwrap();
         let tx_out  = self.event_tx.clone();
@@ -672,7 +674,6 @@ impl ProConductor {
             }
         });
 
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.running.insert(comp.id.clone(), RunningProcess {
             pid, started_at: Instant::now(), child: child_arc,
             cancelled: cancelled.clone(),
