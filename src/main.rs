@@ -1250,33 +1250,40 @@ impl ProConductor {
                         // ── Window controls (Windows custom titlebar only) ─────
                         #[cfg(windows)]
                         {
-                            // Close
-                            let close_r = ui.add(egui::Button::new(
-                                RichText::new("✕").size(13.0).color(TEXT_SEC))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE)
-                                .min_size(Vec2::new(36.0, 36.0)));
-                            if close_r.hovered() {
-                                ui.painter().rect_filled(close_r.rect, 0.0, RED_BG);
+                            // Allocate rects first, then draw — avoids font/char issues
+                            // and keeps them above the drag sense which uses Sense::drag() only
+                            let btn_size = Vec2::new(40.0, 40.0);
+
+                            // Close button
+                            let (close_rect, close_resp) = ui.allocate_exact_size(btn_size, egui::Sense::click());
+                            let painter = ui.painter();
+                            if close_resp.hovered() {
+                                painter.rect_filled(close_rect, 0.0, RED_DIM);
                             }
-                            if close_r.clicked() {
+                            // Draw X manually — two diagonal lines
+                            let p = close_rect.center();
+                            let d = 6.0_f32;
+                            painter.line_segment([egui::pos2(p.x-d, p.y-d), egui::pos2(p.x+d, p.y+d)], Stroke::new(1.5, TEXT_SEC));
+                            painter.line_segment([egui::pos2(p.x+d, p.y-d), egui::pos2(p.x-d, p.y+d)], Stroke::new(1.5, TEXT_SEC));
+                            if close_resp.clicked() {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
 
-                            // Minimize
-                            let min_r = ui.add(egui::Button::new(
-                                RichText::new("─").size(13.0).color(TEXT_SEC))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE)
-                                .min_size(Vec2::new(36.0, 36.0)));
-                            if min_r.hovered() {
-                                ui.painter().rect_filled(min_r.rect, 0.0, BG_HOVER);
+                            // Minimize button
+                            let (min_rect, min_resp) = ui.allocate_exact_size(btn_size, egui::Sense::click());
+                            if min_resp.hovered() {
+                                ui.painter().rect_filled(min_rect, 0.0, BG_HOVER);
                             }
-                            if min_r.clicked() {
+                            // Draw _ manually — horizontal line
+                            let mp = min_rect.center();
+                            ui.painter().line_segment(
+                                [egui::pos2(mp.x-6.0, mp.y+3.0), egui::pos2(mp.x+6.0, mp.y+3.0)],
+                                Stroke::new(1.5, TEXT_SEC));
+                            if min_resp.clicked() {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                             }
 
-                            ui.add_space(8.0);
+                            ui.add_space(4.0);
                         }
 
                         // Stop All
@@ -1329,13 +1336,14 @@ impl ProConductor {
                     });
                 });
 
-                // Drag the window by clicking empty topbar space (Windows custom titlebar)
+                // Drag the window by dragging empty topbar space (Windows custom titlebar).
+                // Use Sense::drag() only — NOT click_and_drag — so button clicks aren't stolen.
                 #[cfg(windows)]
                 {
                     let topbar_resp = ui.interact(
                         ui.min_rect(),
                         ui.id().with("topbar_drag"),
-                        egui::Sense::click_and_drag(),
+                        egui::Sense::drag(),
                     );
                     if topbar_resp.drag_started() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
