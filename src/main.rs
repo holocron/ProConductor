@@ -196,6 +196,7 @@ struct RunningProcess {
     pid:        u32,
     started_at: Instant,
     child:      Arc<Mutex<Child>>,
+    cancelled:  Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn now_hms() -> String {
@@ -643,12 +644,18 @@ impl ProConductor {
         let tx_mon    = self.event_tx.clone();
         let id_mon    = comp.id.clone();
         let ctx_mon   = self.ctx_handle.clone();
+        let cancelled_mon = cancelled.clone();
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_millis(200));
+                // If stop() was called for this component, the entry in `running`
+                // has already been removed. Firing Status here would wrongly remove
+                // a NEW process started with the same component id. Bail out.
+                if cancelled_mon.load(std::sync::atomic::Ordering::Relaxed) { break; }
                 let mut guard = match child_mon.lock() { Ok(g) => g, Err(_) => break };
                 match guard.try_wait() {
                     Ok(Some(status)) => {
+                        if cancelled_mon.load(std::sync::atomic::Ordering::Relaxed) { break; }
                         #[cfg(unix)] let code = {
                             use std::os::unix::process::ExitStatusExt;
                             status.code().or_else(|| status.signal().map(|s| -(s as i32)))
@@ -670,8 +677,10 @@ impl ProConductor {
             }
         });
 
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.running.insert(comp.id.clone(), RunningProcess {
             pid, started_at: Instant::now(), child: child_arc,
+            cancelled: cancelled.clone(),
         });
         // Register PID so signal handler can kill it on Ctrl+C
         self.pid_registry.lock().unwrap().push(pid);
@@ -684,6 +693,8 @@ impl ProConductor {
 
     fn stop(&mut self, id: &str) {
         if let Some(handle) = self.running.remove(id) {
+            // Cancel the monitor thread so it doesn't fire Status on the next start
+            handle.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
             self.stopping.insert(id.to_string(), Instant::now());
             self.pid_registry.lock().unwrap().retain(|&p| p != handle.pid);
             self.logs.entry(id.to_string()).or_default().push(LogLine {
