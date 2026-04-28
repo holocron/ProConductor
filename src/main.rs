@@ -271,8 +271,27 @@ extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
 fn libc_kill(pid: i32, sig: i32) { unsafe { kill(pid, sig); } }
 
 #[cfg(windows)]
+extern "system" {
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+    fn TerminateProcess(handle: isize, code: u32) -> i32;
+    fn CloseHandle(handle: isize) -> i32;
+}
+#[cfg(windows)] const PROCESS_TERMINATE: u32 = 0x0001;
+
+#[cfg(windows)]
 fn kill_tree(pid: u32) {
-    let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+    // TerminateProcess is instant — no waiting for taskkill.exe to start/finish
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h != 0 { TerminateProcess(h, 1); CloseHandle(h); }
+    }
+    // Also fire taskkill for child processes — spawn() returns immediately, don't wait
+    #[allow(unused_imports)]
+    use std::os::windows::process::CommandExt;
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .spawn();
 }
 
 #[cfg(not(any(unix, windows)))]
