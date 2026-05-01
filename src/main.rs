@@ -587,6 +587,11 @@ impl ProConductor {
             just_hid: false,
         };
         if autostart { app.start_all(); }
+
+        // Set initial dock icon immediately (red = nothing running yet)
+        #[cfg(target_os = "macos")]
+        set_dock_icon(DOCK_ICON_RED, DOCK_ICON_W, DOCK_ICON_H);
+
         app
     }
 
