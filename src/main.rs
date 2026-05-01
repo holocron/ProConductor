@@ -342,6 +342,7 @@ fn kill_tree(pid: u32) { let _ = pid; }
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
 fn set_dock_icon(rgba: &[u8], width: u32, height: u32) {
     use objc::{msg_send, sel, sel_impl, class, runtime::Object};
     #[repr(C)] struct NSSize { w: f64, h: f64 }
