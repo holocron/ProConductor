@@ -1141,7 +1141,7 @@ impl eframe::App for ProConductor {
         }
         self.render_topbar(ctx);
         self.render_topbar_controls(ctx);
-        #[cfg(windows)] self.render_window_controls(ctx);
+        #[cfg(any(windows, target_os = "macos"))] self.render_window_controls(ctx);
         self.render_sidebar(ctx);
         self.render_main(ctx);
         self.render_confirm_dialog(ctx);
@@ -1252,7 +1252,7 @@ impl ProConductor {
 
                 // Drag by dragging empty topbar space.
                 // Area::Foreground for window controls takes priority so no conflict.
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 {
                     let topbar_resp = ui.interact(
                         ui.min_rect(),
@@ -1271,7 +1271,7 @@ impl ProConductor {
     fn render_topbar_controls(&mut self, ctx: &egui::Context) {
         let screen_w = ctx.screen_rect().width();
         // Reserve room for window controls on Windows
-        let right_margin: f32 = if cfg!(windows) { 92.0 } else { 8.0 };
+        let right_margin: f32 = if cfg!(windows) || cfg!(target_os = "macos") { 92.0 } else { 8.0 };
         // Estimate content width: Save(80) + pill(60) + gap + StartAll(110) + gap + StopAll(110)
         let area_w = 420.0_f32;
         let x = screen_w - right_margin - area_w;
@@ -1334,7 +1334,7 @@ impl ProConductor {
 
     // ── Window controls overlay (Windows only) ────────────────────────────
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn render_window_controls(&self, ctx: &egui::Context) {
         // Render close and minimize as a floating Area pinned to top-right.
         // This avoids right-to-left layout distorting the hit rects.
@@ -2359,7 +2359,7 @@ Close that window first.", name);
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 580.0])
             // Windows: remove native title bar — we draw our own in render_topbar
-            .with_decorations(!cfg!(windows))
+            .with_decorations(false)
             .with_icon(eframe::icon_data::from_png_bytes(&[]).unwrap_or_default()),
         ..Default::default()
     };
