@@ -344,11 +344,10 @@ fn kill_tree(pid: u32) { let _ = pid; }
 #[cfg(target_os = "macos")]
 fn set_dock_icon(rgba: &[u8], width: u32, height: u32) {
     use objc::{msg_send, sel, sel_impl, class, runtime::Object};
-    use std::ffi::c_void;
     #[repr(C)] struct NSSize { w: f64, h: f64 }
 
     unsafe {
-        let color_space_name = {
+        let color_space_name: *mut Object = {
             let bytes = b"NSDeviceRGBColorSpace\0";
             let s: *mut Object = msg_send![class!(NSString), alloc];
             msg_send![s, initWithUTF8String: bytes.as_ptr()]
