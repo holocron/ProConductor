@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![allow(unexpected_cfgs)] // objc 0.2 macro internals emit cargo-clippy cfg checks
 
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use fs2::FileExt;
@@ -342,14 +343,13 @@ fn kill_tree(pid: u32) { let _ = pid; }
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(target_os = "macos")]
-#[allow(unexpected_cfgs)]
 fn set_dock_icon(rgba: &[u8], width: u32, height: u32) {
     use objc::{msg_send, sel, sel_impl, class, runtime::Object};
     #[repr(C)] struct NSSize { w: f64, h: f64 }
 
     unsafe {
         let color_space_name: *mut Object = {
-            let bytes = b"NSDeviceRGBColorSpace\0";
+            let bytes = b"NSDeviceRGBColorSpace ";
             let s: *mut Object = msg_send![class!(NSString), alloc];
             msg_send![s, initWithUTF8String: bytes.as_ptr()]
         };
@@ -367,15 +367,12 @@ fn set_dock_icon(rgba: &[u8], width: u32, height: u32) {
             bitsPerPixel:   32_isize];
         let dst: *mut u8 = msg_send![rep, bitmapData];
         std::ptr::copy_nonoverlapping(rgba.as_ptr(), dst, rgba.len());
-
         let size = NSSize { w: width as f64, h: height as f64 };
         let img: *mut Object = msg_send![class!(NSImage), alloc];
         let img: *mut Object = msg_send![img, initWithSize: size];
         let _: () = msg_send![img, addRepresentation: rep];
-
         let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![app, setApplicationIconImage: img];
-
         let _: () = msg_send![img, release];
         let _: () = msg_send![rep, release];
     }
