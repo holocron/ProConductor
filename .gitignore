@@ -1,0 +1,14 @@
+# Build artifacts
+/target/
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+
+# Runtime artifacts (per-instance configs & logs stay local)
+proconductor.json
+logs/

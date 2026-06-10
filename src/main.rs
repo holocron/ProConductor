@@ -16,10 +16,15 @@ use tray_icon::{
 struct MSG { hwnd: isize, message: u32, w: usize, l: isize, time: u32, pt_x: i32, pt_y: i32 }
 
 #[cfg(windows)]
+#[repr(C)]
+struct RECT { left: i32, top: i32, right: i32, bottom: i32 }
+
+#[cfg(windows)]
 extern "system" {
     fn FindWindowW(class: *const u16, title: *const u16) -> isize;
     fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
     fn SetWindowLongPtrW(hwnd: isize, index: i32, new: isize) -> isize;
+    fn GetWindowRect(hwnd: isize, rect: *mut RECT) -> i32;
     fn SetWindowPos(hwnd: isize, insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
     fn PeekMessageW(msg: *mut MSG, hwnd: isize, min: u32, max: u32, remove: u32) -> i32;
     fn TranslateMessage(msg: *const MSG) -> i32;
@@ -40,13 +45,16 @@ extern "system" {
 use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{mpsc, Arc, Mutex},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 // Tray icon variants — 32x32 RGBA, loaded from icons/ at compile time
 #[cfg(windows)]
@@ -108,6 +116,13 @@ const AMBER_BG:   Color32 = Color32::from_rgb( 30,  20,   7);
 const BLUE:       Color32 = Color32::from_rgb( 68, 136, 255);
 const BLUE_DIM:   Color32 = Color32::from_rgb( 18,  32, 100);
 
+// Button-state shades — see action_button()
+const RED_GHOST:      Color32 = Color32::from_rgb(150,  70,  80);
+const BLUE_HI:        Color32 = Color32::from_rgb(120, 170, 255);
+const BLUE_BORDER:    Color32 = Color32::from_rgb( 30,  50, 120);
+const GREEN_BG_HOVER: Color32 = Color32::from_rgb( 10,  42,  27);
+const AMBER_BG_HOVER: Color32 = Color32::from_rgb( 45,  30,  10);
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Log syntax highlighting — span-based pipeline (inspired by tailspin)
 // ══════════════════════════════════════════════════════════════════════════════
@@ -124,8 +139,8 @@ pub struct EnvVar {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Component {
-    pub id:           String,
-    pub name:         String,
+    #[serde(default)] pub id:   String,
+    #[serde(default)] pub name: String,
     #[serde(default)] pub executable:  String,
     #[serde(default)] pub working_dir: String,
     #[serde(default)] pub args:        String,
@@ -151,8 +166,8 @@ impl Component {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
-    pub id:         String,
-    pub name:       String,
+    #[serde(default)] pub id:   String,
+    #[serde(default)] pub name: String,
     #[serde(default)] pub components: Vec<Component>,
 }
 
@@ -161,18 +176,73 @@ pub struct AppConfig {
     #[serde(default)] pub groups: Vec<Group>,
 }
 
-fn load_config(path: &PathBuf) -> AppConfig {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// Load the config. A missing file is normal (fresh start); an unreadable or
+/// malformed file is NOT silently replaced — the original is backed up first
+/// and the error is surfaced so a later save can't destroy user data.
+fn load_config(path: &Path) -> (AppConfig, Option<String>) {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (AppConfig::default(), None);
+        }
+        Err(e) => {
+            return (AppConfig::default(), Some(format!(
+                "Could not read {}: {}. Starting empty — saving will overwrite it.",
+                path.display(), e
+            )));
+        }
+    };
+    match serde_json::from_str::<AppConfig>(&raw) {
+        Ok(c)  => (c, None),
+        Err(e) => {
+            let backup = path.with_extension("json.corrupt");
+            let note = match std::fs::copy(path, &backup) {
+                Ok(_)   => format!("Original backed up to {}.", backup.display()),
+                Err(be) => format!("Backup failed: {}.", be),
+            };
+            (AppConfig::default(), Some(format!(
+                "Config {} is not valid JSON ({}). {} Starting empty.",
+                path.display(), e, note
+            )))
+        }
+    }
 }
 
-fn save_config(config: &AppConfig, path: &PathBuf) {
-    if let Some(p) = path.parent() { let _ = std::fs::create_dir_all(p); }
-    if let Ok(s) = serde_json::to_string_pretty(config) {
-        let _ = std::fs::write(path, s);
+/// Repair missing/duplicate ids (e.g. hand-edited config). Returns true if
+/// anything changed so the caller can mark the config dirty.
+fn sanitize_config(config: &mut AppConfig) -> bool {
+    let mut changed = false;
+    let mut seen: HashSet<String> = HashSet::new();
+    for g in &mut config.groups {
+        if g.id.is_empty() || !seen.insert(g.id.clone()) {
+            g.id = Uuid::new_v4().to_string();
+            seen.insert(g.id.clone());
+            changed = true;
+        }
+        for c in &mut g.components {
+            if c.id.is_empty() || !seen.insert(c.id.clone()) {
+                c.id = Uuid::new_v4().to_string();
+                seen.insert(c.id.clone());
+                changed = true;
+            }
+        }
     }
+    changed
+}
+
+/// Atomic save: write to a temp file, then rename over the target — a crash
+/// mid-write can never leave a truncated config behind. Errors propagate so
+/// the caller can keep the dirty flag set and tell the user.
+fn save_config(config: &AppConfig, path: &Path) -> std::io::Result<()> {
+    if let Some(p) = path.parent() {
+        if !p.as_os_str().is_empty() { std::fs::create_dir_all(p)?; }
+    }
+    let s = serde_json::to_string_pretty(config)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, s)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -212,8 +282,7 @@ struct RunningProcess {
 }
 
 fn now_hms() -> String {
-    let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    format!("{:02}:{:02}:{:02}", (s % 86400) / 3600, (s % 3600) / 60, s % 60)
+    chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
 fn format_uptime(started: Instant) -> String {
@@ -227,115 +296,133 @@ fn split_args(s: &str) -> Vec<String> {
     let mut args = vec![];
     let mut cur = String::new();
     let mut quote: Option<char> = None;
+    let mut was_quoted = false; // so an explicitly empty "" argument is kept
     for ch in s.chars() {
         match quote {
             Some(q) if ch == q => quote = None,
             Some(_) => cur.push(ch),
             None => match ch {
-                '"' | '\'' => quote = Some(ch),
-                ' ' | '\t' => { if !cur.is_empty() { args.push(cur.drain(..).collect()); } }
+                '"' | '\'' => { quote = Some(ch); was_quoted = true; }
+                ' ' | '\t' => {
+                    if !cur.is_empty() || was_quoted {
+                        args.push(std::mem::take(&mut cur));
+                        was_quoted = false;
+                    }
+                }
                 _ => cur.push(ch),
             },
         }
     }
-    if !cur.is_empty() { args.push(cur); }
+    if !cur.is_empty() || was_quoted { args.push(cur); }
     args
 }
 
 /// Resolve a path from the config: if relative, anchor it to the config file's
 /// directory so the whole project folder is portable.
-fn resolve_path(raw: &str, base_dir: &PathBuf) -> PathBuf {
+fn resolve_path(raw: &str, base_dir: &Path) -> PathBuf {
     let p = PathBuf::from(raw);
     if p.is_absolute() { p } else { base_dir.join(p) }
 }
 
-fn resolve_log_path(raw: &str, comp_name: &str, base_dir: &PathBuf) -> Option<PathBuf> {
+fn resolve_log_path(raw: &str, comp_name: &str, base_dir: &Path) -> Option<PathBuf> {
     if raw.is_empty() { return None; }
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let days = (secs / 86400) as u32;
-    let date = days_to_ymd(days);
-    let expanded = raw.replace("{name}", comp_name).replace("{date}", &date);
+    // {name} is user input — strip path separators and reserved characters so a
+    // component name can't redirect the log file elsewhere.
+    let safe_name: String = comp_name.chars()
+        .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let expanded = raw.replace("{name}", &safe_name).replace("{date}", &date);
     Some(resolve_path(&expanded, base_dir))
 }
 
-fn days_to_ymd(days: u32) -> String {
-    let jd = days + 2440588;
-    let l  = jd + 68569;
-    let n  = 4 * l / 146097;
-    let l  = l - (146097 * n + 3) / 4;
-    let i  = 4000 * (l + 1) / 1461001;
-    let l  = l - 1461 * i / 4 + 31;
-    let j  = 80 * l / 2447;
-    let d  = l - 2447 * j / 80;
-    let l  = j / 11;
-    let mo = j + 2 - 12 * l;
-    let y  = 100 * (n - 49) + i + l;
-    format!("{:04}-{:02}-{:02}", y, mo, d)
-}
+/// How long a process tree gets to shut down gracefully before force-kill.
+/// The UI "Stopping" progress bar is driven by this same constant.
+const GRACE_PERIOD_MS: u64 = 8000;
 
-#[cfg(unix)]
-fn kill_tree(pid: u32) {
-    // Kill the whole process group
-    libc_kill(-(pid as i32), 15);
-}
 #[cfg(unix)]
 extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
 #[cfg(unix)]
 fn libc_kill(pid: i32, sig: i32) { unsafe { kill(pid, sig); } }
+
+/// Ask the whole process tree to shut down. Returns false if the request
+/// could not be delivered (caller should skip the grace wait and force-kill).
+#[cfg(unix)]
+fn graceful_kill_tree(pid: u32) -> bool {
+    libc_kill(-(pid as i32), 15); // SIGTERM to the process group
+    true
+}
+#[cfg(unix)]
+fn force_kill_tree(pid: u32) {
+    libc_kill(-(pid as i32), 9); // SIGKILL to the process group
+}
 
 #[cfg(windows)]
 extern "system" {
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
     fn TerminateProcess(handle: isize, code: u32) -> i32;
     fn CloseHandle(handle: isize) -> i32;
-    fn WaitForSingleObject(handle: isize, ms: u32) -> u32;
 }
-#[cfg(windows)] const PROCESS_TERMINATE:    u32 = 0x0001;
-#[cfg(windows)] const PROCESS_SYNCHRONIZE:  u32 = 0x00100000;
-#[cfg(windows)] const WAIT_TIMEOUT:         u32 = 0x00000102;
-#[cfg(windows)] const GRACE_PERIOD_MS:      u32 = 8000;
+#[cfg(windows)] const PROCESS_TERMINATE: u32 = 0x0001;
 
+// taskkill without /F sends WM_CLOSE to GUI processes; it refuses to signal
+// console processes and reports failure — we use that to skip the grace wait.
+// IMPORTANT: Never call FreeConsole()/AttachConsole() from our process —
+// that invalidates our own stdio handles causing ERROR_INVALID_HANDLE (os error 6)
+// on the next process spawn.
 #[cfg(windows)]
-fn kill_tree(pid: u32) {
+fn graceful_kill_tree(pid: u32) -> bool {
     use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-    // Step 1: Ask the process tree to shut down gracefully via taskkill WITHOUT /F.
-    // This sends WM_CLOSE to all windows and Ctrl+Break to console processes in the tree.
-    // We use .spawn() so this returns immediately — we wait separately below.
-    // IMPORTANT: Never call FreeConsole()/AttachConsole() from our process —
-    // that invalidates our own stdio handles causing ERROR_INVALID_HANDLE (os error 6)
-    // on the next process spawn.
-    let _ = Command::new("taskkill")
+    Command::new("taskkill")
         .args(["/T", "/PID", &pid.to_string()])
         .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
 
-    // Step 2: Wait up to GRACE_PERIOD_MS for the main process to exit.
-    let exited_cleanly = unsafe {
-        let h = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid);
-        if h == 0 {
-            true // already gone
-        } else {
-            let result = WaitForSingleObject(h, GRACE_PERIOD_MS);
-            let clean  = result != WAIT_TIMEOUT;
-            if !clean {
-                // Step 3: Grace period expired — force kill
-                TerminateProcess(h, 1);
-                let _ = Command::new("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .spawn();
-            }
-            CloseHandle(h);
-            clean
-        }
-    };
-    let _ = exited_cleanly;
+// Force-kill: taskkill /F /T must run FIRST — it enumerates the tree from the
+// root pid, so terminating the root before it would orphan every grandchild.
+// TerminateProcess on the root is the fallback if taskkill itself fails.
+#[cfg(windows)]
+fn force_kill_tree(pid: u32) {
+    use std::os::windows::process::CommandExt;
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h != 0 { TerminateProcess(h, 1); CloseHandle(h); }
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn kill_tree(pid: u32) { let _ = pid; }
+fn graceful_kill_tree(pid: u32) -> bool { let _ = pid; true }
+#[cfg(not(any(unix, windows)))]
+fn force_kill_tree(pid: u32) { let _ = pid; }
+
+/// Full stop sequence for one child: graceful signal → poll for exit up to
+/// `grace_ms` → force-kill the tree → reap the child so it never zombies.
+/// Blocks the calling thread; run on a worker thread for interactive stops.
+fn stop_process_tree(pid: u32, child: &Arc<Mutex<Child>>, grace_ms: u64) {
+    let graceful = graceful_kill_tree(pid);
+    // If the graceful request couldn't be delivered there is nothing to wait for.
+    let wait_ms = if graceful { grace_ms } else { 300 };
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    loop {
+        if let Ok(mut c) = child.try_lock() {
+            if matches!(c.try_wait(), Ok(Some(_))) { return; } // exited + reaped
+        }
+        if Instant::now() >= deadline { break; }
+        thread::sleep(Duration::from_millis(100));
+    }
+    force_kill_tree(pid);
+    if let Ok(mut c) = child.lock() {
+        let _ = c.kill();
+        let _ = c.wait(); // reap — no zombie left behind
+    }
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // macOS dock icon
@@ -344,15 +431,19 @@ fn kill_tree(pid: u32) { let _ = pid; }
 #[cfg(target_os = "macos")]
 fn set_dock_icon(rgba: &[u8], width: u32, height: u32) {
     use objc2_app_kit::{NSApplication, NSBitmapImageRep, NSImage};
-    use objc2_foundation::{NSString, NSSize, NSObject};
-    use objc2::rc::Retained;
+    use objc2_foundation::{NSString, NSSize, MainThreadMarker};
+    use objc2::AnyThread;
+
+    // The copy below trusts the caller's dimensions; a short buffer would read
+    // out of bounds. (bytesPerRow is pinned to width*4, so no row padding.)
+    if rgba.len() != (width as usize) * (height as usize) * 4 { return; }
 
     unsafe {
         let color_space = NSString::from_str("NSDeviceRGBColorSpace");
 
         // Build NSBitmapImageRep from our RGBA buffer
         let rep = NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
-            &NSBitmapImageRep::alloc(),
+            NSBitmapImageRep::alloc(),
             std::ptr::null_mut(),
             width as isize,
             height as isize,
@@ -366,7 +457,7 @@ fn set_dock_icon(rgba: &[u8], width: u32, height: u32) {
         );
         if let Some(rep) = rep {
             // Copy pixel data
-            let dst = rep.bitmapData();
+            let dst: *mut u8 = rep.bitmapData();
             if !dst.is_null() {
                 std::ptr::copy_nonoverlapping(rgba.as_ptr(), dst, rgba.len());
             }
@@ -374,7 +465,9 @@ fn set_dock_icon(rgba: &[u8], width: u32, height: u32) {
             let size = NSSize { width: width as f64, height: height as f64 };
             let img = NSImage::initWithSize(NSImage::alloc(), size);
             img.addRepresentation(&rep);
-            NSApplication::sharedApplication().setApplicationIconImage(Some(&img));
+            // SAFETY: dock icon is set from the egui paint callback, which runs on the main thread.
+            let mtm = MainThreadMarker::new_unchecked();
+            NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&img));
         }
     }
 }
@@ -410,14 +503,18 @@ struct ProConductor {
     // Runtime
     running:    HashMap<String, RunningProcess>,
     stopping:   HashMap<String, Instant>,   // id → when stop was requested
+    last_exit:  HashMap<String, i32>,       // id → last nonzero exit code (crash badge)
     logs:       HashMap<String, Vec<LogLine>>,
     event_tx:   mpsc::Sender<AppEvent>,
     event_rx:   mpsc::Receiver<AppEvent>,
     ctx_handle: egui::Context,
 
+    // Error banners — shown until dismissed
+    config_load_error: Option<String>,
+    save_error:        Option<String>,
+
     // UI
     start_minimized: bool,   // send minimize command on first frame
-    #[cfg(windows)]
     #[cfg(windows)]
     tray_cmd_tx: Option<mpsc::Sender<TrayCmd>>,  // send icon-change cmds to tray thread
     #[cfg(windows)]
@@ -441,7 +538,8 @@ struct ProConductor {
 }
 
 impl ProConductor {
-    fn new(cc: &eframe::CreationContext, config: AppConfig, path: PathBuf, lock: std::fs::File, pid_registry: PidRegistry, autostart: bool, minimized: bool) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(cc: &eframe::CreationContext, config: AppConfig, path: PathBuf, lock: std::fs::File, pid_registry: PidRegistry, autostart: bool, minimized: bool, load_error: Option<String>, initial_dirty: bool) -> Self {
         // Apply dark theme with our custom palette
         let mut visuals = egui::Visuals::dark();
         visuals.window_fill              = BG_BASE;
@@ -556,12 +654,15 @@ impl ProConductor {
         let mut app = Self {
             config,
             config_path: path,
-            dirty: false,
+            dirty: initial_dirty,
             _lock: lock,
             pid_registry,
             running: HashMap::new(),
             stopping: HashMap::new(),
+            last_exit: HashMap::new(),
             logs: HashMap::new(),
+            config_load_error: load_error,
+            save_error: None,
             event_tx: tx,
             event_rx: rx,
             ctx_handle: cc.egui_ctx.clone(),
@@ -602,16 +703,22 @@ impl ProConductor {
         if self.running.contains_key(&comp.id) { return; }
         // Clear any stale stopping entry — user clicked Start before grace period ended
         self.stopping.remove(&comp.id);
+        self.last_exit.remove(&comp.id);
 
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut args = split_args(&comp.args);
 
-        // sudo -u <user> on Unix
+        // sudo -n -u <user> -- <exe> on Unix.
+        // -n: fail fast instead of hanging on a password prompt (we have no TTY).
+        // --: stop option parsing so a user/executable starting with '-' can't
+        //     inject sudo options.
         let exe = if !comp.run_as_user.is_empty() {
             #[cfg(unix)] {
                 args.insert(0, comp.executable.clone());
+                args.insert(0, "--".into());
                 args.insert(0, comp.run_as_user.clone());
                 args.insert(0, "-u".into());
+                args.insert(0, "-n".into());
                 "sudo".to_string()
             }
             #[cfg(not(unix))]
@@ -638,7 +745,6 @@ impl ProConductor {
         // Windows: hide child console windows — stdout/stderr captured via pipes
         #[cfg(windows)] {
             use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
@@ -657,47 +763,45 @@ impl ProConductor {
         let pid = child.id();
         let child_arc = Arc::new(Mutex::new(child));
 
-        // Open log file if configured
-        let log_file: Option<Arc<Mutex<std::fs::File>>> = resolve_log_path(&comp.log_path, &comp.name, &base_dir)
-            .and_then(|p| {
-                if let Some(par) = p.parent() { let _ = std::fs::create_dir_all(par); }
-                std::fs::OpenOptions::new().create(true).append(true).open(&p).ok()
-            })
-            .map(|f| Arc::new(Mutex::new(f)));
+        // Lazily-opened, date-rollover-aware on-disk log writer (shared by both
+        // reader threads)
+        let log_writer: Option<Arc<Mutex<LogWriter>>> = (!comp.log_path.is_empty())
+            .then(|| Arc::new(Mutex::new(LogWriter::new(
+                comp.log_path.clone(), comp.name.clone(), base_dir.clone(),
+            ))));
 
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // ── Stdout thread
-        let stdout = child_arc.lock().unwrap().stdout.take().unwrap();
-        let tx_out  = self.event_tx.clone();
-        let id_out  = comp.id.clone();
-        let lf_out  = log_file.clone();
-        let ctx_out = self.ctx_handle.clone();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().flatten() {
-                write_log_file(&lf_out, "OUT", &line);
-                let _ = tx_out.send(AppEvent::Log { id: id_out.clone(), line: LogLine {
-                    time: now_hms(), source: Source::Stdout, text: line,
-                }});
-                ctx_out.request_repaint();
-            }
-        });
+        // Reader thread body, shared by stdout/stderr: forward each line to the
+        // UI and the on-disk log; surface log-file open failures as SYS lines.
+        let spawn_reader = |pipe: Box<dyn std::io::Read + Send>, source: Source, disk_tag: &'static str| {
+            let tx     = self.event_tx.clone();
+            let id     = comp.id.clone();
+            let writer = log_writer.clone();
+            let ctx    = self.ctx_handle.clone();
+            thread::spawn(move || {
+                read_lines_capped(pipe, |text| {
+                    if let Some(w) = &writer {
+                        if let Ok(mut w) = w.lock() {
+                            if let Some(err) = w.write_line(disk_tag, &text) {
+                                let _ = tx.send(AppEvent::Log { id: id.clone(), line: LogLine {
+                                    time: now_hms(), source: Source::System, text: err,
+                                }});
+                            }
+                        }
+                    }
+                    let _ = tx.send(AppEvent::Log { id: id.clone(), line: LogLine {
+                        time: now_hms(), source: source.clone(), text,
+                    }});
+                    ctx.request_repaint();
+                });
+            });
+        };
 
-        // ── Stderr thread
+        let stdout = child_arc.lock().unwrap().stdout.take().unwrap();
+        spawn_reader(Box::new(stdout), Source::Stdout, "STDOUT");
         let stderr = child_arc.lock().unwrap().stderr.take().unwrap();
-        let tx_err  = self.event_tx.clone();
-        let id_err  = comp.id.clone();
-        let lf_err  = log_file.clone();
-        let ctx_err = self.ctx_handle.clone();
-        thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().flatten() {
-                write_log_file(&lf_err, "ERR", &line);
-                let _ = tx_err.send(AppEvent::Log { id: id_err.clone(), line: LogLine {
-                    time: now_hms(), source: Source::Stderr, text: line,
-                }});
-                ctx_err.request_repaint();
-            }
-        });
+        spawn_reader(Box::new(stderr), Source::Stderr, "STDERR");
 
         // ── Monitor thread: wait for exit
         let child_mon = child_arc.clone();
@@ -718,7 +822,7 @@ impl ProConductor {
                         if cancelled_mon.load(std::sync::atomic::Ordering::Relaxed) { break; }
                         #[cfg(unix)] let code = {
                             use std::os::unix::process::ExitStatusExt;
-                            status.code().or_else(|| status.signal().map(|s| -(s as i32)))
+                            status.code().or_else(|| status.signal().map(|s| -s))
                         };
                         #[cfg(not(unix))] let code = status.code();
                         let _ = tx_mon.send(AppEvent::Log { id: id_mon.clone(), line: LogLine {
@@ -755,7 +859,6 @@ impl ProConductor {
             // Cancel the monitor thread so it doesn't fire Status on the next start
             handle.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
             self.stopping.insert(id.to_string(), Instant::now());
-            self.pid_registry.lock().unwrap().retain(|&p| p != handle.pid);
             self.logs.entry(id.to_string()).or_default().push(LogLine {
                 time: now_hms(), source: Source::System, text: "Stop requested…".into(),
             });
@@ -765,22 +868,50 @@ impl ProConductor {
             let ctx       = self.ctx_handle.clone();
             let tx        = self.event_tx.clone();
             let id_owned  = id.to_string();
+            let registry  = self.pid_registry.clone();
             thread::spawn(move || {
-                kill_tree(pid);
-                // Send Stopped immediately after kill_tree — do NOT try to acquire
-                // child_arc lock here as the monitor thread may hold it and cause delay
+                stop_process_tree(pid, &child_arc, GRACE_PERIOD_MS);
+                // Only now is the process confirmed dead — deregistering earlier
+                // would hide a TERM-ignoring child from the Ctrl+C handler.
+                registry.lock().unwrap().retain(|&p| p != pid);
                 let _ = tx.send(AppEvent::Stopped { id: id_owned });
                 ctx.request_repaint();
-                // Belt-and-suspenders kill via child handle (non-blocking attempt)
-                if let Ok(mut c) = child_arc.try_lock() { let _ = c.kill(); }
             });
         }
+    }
+
+    /// Synchronous shutdown for app exit: signal every tree, give them a short
+    /// shared grace window, then force-kill stragglers — all on this thread,
+    /// because detached kill threads die with the process.
+    fn shutdown_sync(&mut self) {
+        const EXIT_GRACE_MS: u64 = 2000;
+        let handles: Vec<RunningProcess> = self.running.drain().map(|(_, h)| h).collect();
+        if handles.is_empty() { return; }
+        for h in &handles {
+            h.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            graceful_kill_tree(h.pid);
+        }
+        let deadline = Instant::now() + Duration::from_millis(EXIT_GRACE_MS);
+        for h in handles {
+            let dead = loop {
+                if let Ok(mut c) = h.child.try_lock() {
+                    if matches!(c.try_wait(), Ok(Some(_))) { break true; }
+                }
+                if Instant::now() >= deadline { break false; }
+                thread::sleep(Duration::from_millis(50));
+            };
+            if !dead {
+                force_kill_tree(h.pid);
+                if let Ok(mut c) = h.child.try_lock() { let _ = c.kill(); let _ = c.wait(); }
+            }
+        }
+        self.pid_registry.lock().unwrap().clear();
     }
 
     fn start_all(&mut self) {
         let comps: Vec<Component> = self.config.groups.iter()
             .flat_map(|g| g.components.iter().cloned())
-            .filter(|c| !self.running.contains_key(&c.id))
+            .filter(|c| !self.running.contains_key(&c.id) && !self.stopping.contains_key(&c.id))
             .collect();
         for c in comps { self.start(&c); }
     }
@@ -794,7 +925,7 @@ impl ProConductor {
         let comps: Vec<Component> = self.config.groups.iter()
             .find(|g| g.id == group_id)
             .map(|g| g.components.iter()
-                .filter(|c| !self.running.contains_key(&c.id))
+                .filter(|c| !self.running.contains_key(&c.id) && !self.stopping.contains_key(&c.id))
                 .cloned().collect())
             .unwrap_or_default();
         for c in comps { self.start(&c); }
@@ -828,15 +959,34 @@ impl ProConductor {
                     buf.push(line);
                     if buf.len() > 5000 { buf.drain(..500); }
                 }
-                AppEvent::Status { id, running, .. } => {
+                AppEvent::Status { id, running, exit_code, .. } => {
                     if !running {
-                        self.running.remove(&id);
+                        // Prune the PID so the Ctrl+C handler can never signal a
+                        // recycled PID belonging to an unrelated process.
+                        if let Some(h) = self.running.remove(&id) {
+                            self.pid_registry.lock().unwrap().retain(|&p| p != h.pid);
+                        }
                         self.stopping.remove(&id);
+                        match exit_code {
+                            Some(c) if c != 0 => { self.last_exit.insert(id, c); }
+                            _                 => { self.last_exit.remove(&id); }
+                        }
                     }
                 }
                 AppEvent::Stopped { id } => { self.stopping.remove(&id); }
                 AppEvent::ShowWindow => { self.show_window_requested = true; }
                 AppEvent::QuitApp    => { self.quit_requested        = true; }
+            }
+        }
+    }
+
+    /// Save the config; on failure keep the dirty flag set and surface the error.
+    fn persist(&mut self) {
+        match save_config(&self.config, &self.config_path) {
+            Ok(())  => { self.dirty = false; self.save_error = None; }
+            Err(e)  => {
+                self.dirty = true;
+                self.save_error = Some(format!("Failed to save {}: {}", self.config_path.display(), e));
             }
         }
     }
@@ -848,12 +998,94 @@ impl ProConductor {
     }
 }
 
-fn write_log_file(f: &Option<Arc<Mutex<std::fs::File>>>, src: &str, text: &str) {
-    use std::io::Write;
-    if let Some(arc) = f {
-        if let Ok(mut g) = arc.lock() {
-            let _ = writeln!(g, "[{}] {}", src, text);
+/// On-disk log writer. Re-resolves the {date}/{name} template on every line so
+/// the file rolls over at midnight, and emits each line as a single write_all
+/// on an O_APPEND handle so concurrent writers can't interleave mid-line.
+struct LogWriter {
+    template:       String,
+    comp_name:      String,
+    base_dir:       PathBuf,
+    current_path:   Option<PathBuf>,
+    file:           Option<std::fs::File>,
+    error_reported: bool,
+}
+
+impl LogWriter {
+    fn new(template: String, comp_name: String, base_dir: PathBuf) -> Self {
+        Self { template, comp_name, base_dir, current_path: None, file: None, error_reported: false }
+    }
+
+    /// Write one line. Returns an error message exactly once per failing path
+    /// so the caller can surface it in the in-app log instead of dropping it.
+    fn write_line(&mut self, src: &str, text: &str) -> Option<String> {
+        use std::io::Write;
+        let want = resolve_log_path(&self.template, &self.comp_name, &self.base_dir)?;
+        if self.file.is_none() || self.current_path.as_ref() != Some(&want) {
+            if let Some(par) = want.parent() { let _ = std::fs::create_dir_all(par); }
+            match std::fs::OpenOptions::new().create(true).append(true).open(&want) {
+                Ok(f) => {
+                    self.file = Some(f);
+                    self.current_path = Some(want);
+                    self.error_reported = false;
+                }
+                Err(e) => {
+                    self.file = None;
+                    if !self.error_reported {
+                        self.error_reported = true;
+                        return Some(format!("Cannot open log file {}: {}", want.display(), e));
+                    }
+                    return None;
+                }
+            }
         }
+        if let Some(f) = &mut self.file {
+            let _ = f.write_all(format!("[{}] {}\n", src, text).as_bytes());
+        }
+        None
+    }
+}
+
+/// Stream a pipe into lines without the failure modes of `.lines()`:
+/// non-UTF8 bytes are replaced (not dropped), a newline-free stream is flushed
+/// every MAX_LINE_BYTES instead of buffering unboundedly, and a persistent
+/// read error ends the loop instead of spinning forever.
+const MAX_LINE_BYTES: usize = 16 * 1024;
+
+fn read_lines_capped<R: std::io::Read>(inner: R, mut on_line: impl FnMut(String)) {
+    let mut r = BufReader::new(inner);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let available = match r.fill_buf() {
+            Ok(a) => a,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if available.is_empty() { break; } // EOF
+        let avail_len = available.len();
+        let mut start = 0;
+        while start < avail_len {
+            match available[start..].iter().position(|&b| b == b'\n') {
+                Some(rel) => {
+                    buf.extend_from_slice(&available[start..start + rel]);
+                    if buf.last() == Some(&b'\r') { buf.pop(); }
+                    on_line(String::from_utf8_lossy(&buf).into_owned());
+                    buf.clear();
+                    start += rel + 1;
+                }
+                None => {
+                    buf.extend_from_slice(&available[start..]);
+                    start = avail_len;
+                }
+            }
+            if buf.len() >= MAX_LINE_BYTES {
+                on_line(String::from_utf8_lossy(&buf).into_owned());
+                buf.clear();
+            }
+        }
+        r.consume(avail_len);
+    }
+    if !buf.is_empty() {
+        on_line(String::from_utf8_lossy(&buf).into_owned());
     }
 }
 
@@ -923,15 +1155,23 @@ fn find_numbers(text: &str, spans: &mut Vec<HSpan>) {
 
 // ── Quoted strings ────────────────────────────────────────────────────────────
 fn find_quoted(text: &str, spans: &mut Vec<HSpan>) {
+    let b = text.as_bytes();
     for quote in [b'"', b'\''] {
-        let b = text.as_bytes();
-        let mut positions = Vec::new();
-        for (i, &c) in b.iter().enumerate() { if c == quote { positions.push(i); } }
-        if positions.len() >= 2 {
-            let mut j = 0;
-            while j + 1 < positions.len() {
-                push(spans, positions[j], positions[j+1]+1, HL_STRING, false, 40);
-                j += 2;
+        let mut open: Option<usize> = None;
+        for (i, &c) in b.iter().enumerate() {
+            if c != quote { continue; }
+            match open {
+                // An opening quote must not follow an alphanumeric character —
+                // this keeps apostrophes in contractions ("don't") from pairing.
+                None => {
+                    if i == 0 || !b[i - 1].is_ascii_alphanumeric() {
+                        open = Some(i);
+                    }
+                }
+                Some(s) => {
+                    push(spans, s, i + 1, HL_STRING, false, 40);
+                    open = None;
+                }
             }
         }
     }
@@ -1173,6 +1413,54 @@ fn highlight_log_line(
     job
 }
 
+/// Lines that actually carry error vocabulary — independent of which stream
+/// they arrived on. Many healthy servers write access logs to stderr.
+fn looks_like_error(text: &str) -> bool {
+    let l = text.to_lowercase();
+    l.contains("error") || l.contains("exception") || l.contains("traceback")
+        || l.contains("fatal") || l.contains("panic") || l.contains("critical")
+        || l.starts_with("  file \"")
+}
+
+/// Build the full row for one log line: timestamp + stream tag + highlighted
+/// text, as ONE LayoutJob. Using ui.horizontal() would split the row into
+/// multiple widgets which egui clips to available_width, breaking h-scroll.
+///
+/// Stream ≠ severity: plain stderr gets a muted lowercase "err" tag; the loud
+/// red "ERR" is reserved for lines that actually look like errors.
+fn log_line_job(line: &LogLine, font_id: &egui::FontId) -> egui::text::LayoutJob {
+    let is_real_error = looks_like_error(&line.text);
+    let base_color = if is_real_error { Color32::from_rgb(240, 120, 130) } else { TEXT_PRI };
+
+    let (src_text, src_color) = match line.source {
+        Source::Stdout => ("OUT", BLUE),
+        Source::Stderr => if is_real_error { ("ERR", RED) } else { ("err", TEXT_MUTED) },
+        Source::System => ("SYS", AMBER),
+    };
+
+    let dim_fmt = egui::text::TextFormat { font_id: font_id.clone(), color: TEXT_DIM, ..Default::default() };
+    let src_fmt = egui::text::TextFormat { font_id: font_id.clone(), color: src_color, ..Default::default() };
+
+    let mut job = highlight_log_line(&line.text, base_color, font_id);
+    let text_part = std::mem::take(&mut job.text);
+    let sections  = std::mem::take(&mut job.sections);
+    let mut full_job = egui::text::LayoutJob::default();
+    full_job.wrap.max_width = f32::INFINITY;
+    full_job.append(&line.time, 0.0, dim_fmt.clone());
+    full_job.append("  ", 0.0, dim_fmt.clone());
+    full_job.append(src_text, 0.0, src_fmt);
+    full_job.append(" ", 0.0, dim_fmt);
+    // Re-add the highlighted text sections at the shifted offset
+    let offset = full_job.text.len();
+    full_job.text.push_str(&text_part);
+    for mut s in sections {
+        s.byte_range.start += offset;
+        s.byte_range.end   += offset;
+        full_job.sections.push(s);
+    }
+    full_job
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Rendering
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1208,7 +1496,8 @@ impl eframe::App for ProConductor {
         // ShowWindow is now done directly via Win32 in the tray thread
         self.show_window_requested = false;
         if self.quit_requested {
-            self.stop_all();
+            // No stop_all() here — on_exit() does a synchronous shutdown; spawning
+            // detached kill threads now would let the process exit out from under them.
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -1230,9 +1519,14 @@ impl eframe::App for ProConductor {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Kill all child processes before the window closes.
-        // The exclusive file lock (_lock) is released automatically when self is dropped.
-        self.stop_all();
+        // Unsaved config changes must not be silently lost on quit.
+        if self.dirty {
+            let _ = save_config(&self.config, &self.config_path);
+        }
+        // Kill all child processes synchronously before the process exits —
+        // detached kill threads would die with us and orphan the children.
+        // The exclusive file lock (_lock) is released automatically on drop.
+        self.shutdown_sync();
     }
 }
 
@@ -1264,12 +1558,27 @@ impl ProConductor {
             unsafe {
                 let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
                 if hwnd != 0 {
+                    // Snapshot rect before touching styles — SWP_FRAMECHANGED triggers
+                    // WM_NCCALCSIZE which can collapse a borderless (undecorated) window
+                    // to zero size on some Windows x64 configurations.
+                    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    GetWindowRect(hwnd, &mut rect);
+                    let w = rect.right - rect.left;
+                    let h = rect.bottom - rect.top;
+
                     // Remove from taskbar
                     let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
                     let ex = (ex & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW;
                     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
                     SetWindowPos(hwnd, 0, 0, 0, 0, 0,
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+
+                    // Re-apply the snapshotted size: SWP_FRAMECHANGED can collapse
+                    // borderless windows during WM_NCCALCSIZE processing.
+                    if w > 0 && h > 0 {
+                        SetWindowPos(hwnd, 0, rect.left, rect.top, w, h, SWP_NOZORDER);
+                    }
+
                     // Share HWND with tray thread — it will call ShowWindow directly
                     if let Some(ref tx) = self.tray_cmd_tx {
                         let _ = tx.send(TrayCmd::SetHwnd(hwnd));
@@ -1351,14 +1660,19 @@ impl ProConductor {
     // ── Topbar right-side controls ────────────────────────────────────────
 
     fn render_topbar_controls(&mut self, ctx: &egui::Context) {
-        let screen_w = ctx.screen_rect().width();
-        // Reserve room for window controls on Windows
+        // Reserve room for window controls on Windows/macOS
         let right_margin: f32 = if cfg!(windows) || cfg!(target_os = "macos") { 92.0 } else { 8.0 };
-        // Estimate content width: Save(80) + pill(60) + gap + StartAll(110) + gap + StopAll(110)
-        let area_w = 420.0_f32;
-        let x = screen_w - right_margin - area_w;
 
-        egui::Area::new(egui::Id::new("topbar_controls"))
+        // NOTE: Area::anchor() can't be used here — it aligns within
+        // ctx.available_rect(), which already excludes the topbar panel, so
+        // RIGHT_TOP would land BELOW the topbar, overlapping the dashboard.
+        // Position absolutely instead, right-aligned via the area's own width
+        // as measured last frame (no hardcoded width estimate).
+        let area_id = egui::Id::new("topbar_controls");
+        let last_w = ctx.memory(|m| m.area_rect(area_id).map(|r| r.width())).unwrap_or(420.0);
+        let x = ctx.screen_rect().width() - right_margin - last_w;
+
+        egui::Area::new(area_id)
             .fixed_pos(egui::pos2(x, 0.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
@@ -1366,14 +1680,13 @@ impl ProConductor {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
 
-                    // Save button
+                    // Save button — amber: "unsaved changes need attention"
                     if self.dirty {
                         let save_btn = egui::Button::new(
                             RichText::new("💾 Save").size(11.0).color(AMBER)
-                        ).fill(Color32::from_rgb(30,20,7)).stroke(Stroke::new(1.0, Color32::from_rgb(74,48,10)));
+                        ).fill(AMBER_BG).stroke(Stroke::new(1.0, AMBER_DIM));
                         if ui.add(save_btn).clicked() {
-                            save_config(&self.config, &self.config_path);
-                            self.dirty = false;
+                            self.persist();
                         }
                     }
 
@@ -1395,19 +1708,16 @@ impl ProConductor {
 
                     // Start All
                     let all_running = run == tot && tot > 0;
-                    let start_btn = egui::Button::new(
-                        RichText::new("▶  Start All").size(12.0).color(if all_running { GREEN_DIM } else { GREEN })
-                    ).fill(GREEN_BG).stroke(Stroke::new(1.0, if all_running { GREEN_DIM } else { GREEN }));
-                    if ui.add_enabled(!all_running && tot > 0, start_btn).clicked() {
+                    if action_button(ui, BtnKind::Positive, "▶  Start All", 12.0, 0.0, !all_running && tot > 0)
+                        .clicked() {
                         self.start_all();
                     }
 
-                    // Stop All
+                    // Stop All — amber: interrupting is routine, red stays
+                    // reserved for destructive actions
                     let all_stopped = run == 0;
-                    let stop_btn = egui::Button::new(
-                        RichText::new("■  Stop All").size(12.0).color(if all_stopped { RED_DIM } else { RED })
-                    ).fill(RED_BG).stroke(Stroke::new(1.0, if all_stopped { RED_DIM } else { RED }));
-                    if ui.add_enabled(!all_stopped, stop_btn).clicked() {
+                    if action_button(ui, BtnKind::Caution, "■  Stop All", 12.0, 0.0, !all_stopped)
+                        .clicked() {
                         self.stop_all();
                     }
                 });
@@ -1435,7 +1745,12 @@ impl ProConductor {
                             .stroke(Stroke::NONE)
                             .min_size(Vec2::new(40.0, 40.0))
                     );
-                    if min.hovered() { ui.painter().rect_filled(min.rect, 2.0, BG_HOVER); }
+                    if min.hovered() {
+                        ui.painter().rect_filled(min.rect, 2.0, BG_HOVER);
+                        // Redraw glyph on top of highlight so it stays visible
+                        ui.painter().text(min.rect.center(), egui::Align2::CENTER_CENTER,
+                            "_", egui::FontId::proportional(12.0), TEXT_PRI);
+                    }
                     if min.clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)); }
 
                     // Close
@@ -1633,10 +1948,42 @@ impl ProConductor {
 
     // ── Main panel ─────────────────────────────────────────────────────────
 
+    /// Dismissible error banners (config load / save failures) — shown above
+    /// every view so a failed save can't go unnoticed.
+    fn render_banners(&mut self, ui: &mut egui::Ui) {
+        let mut dismiss_load = false;
+        let mut dismiss_save = false;
+        for (msg, is_load) in [(&self.config_load_error, true), (&self.save_error, false)] {
+            let Some(text) = msg else { continue };
+            egui::Frame::none()
+                .fill(RED_BG)
+                .stroke(Stroke::new(1.0, RED_DIM))
+                .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("⚠").size(12.0).color(RED));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button(RichText::new("✕").size(10.0).color(TEXT_SEC))
+                                .on_hover_text("Dismiss").clicked() {
+                                if is_load { dismiss_load = true; } else { dismiss_save = true; }
+                            }
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.label(RichText::new(text).size(11.0).color(TEXT_PRI));
+                            });
+                        });
+                    });
+                });
+        }
+        if dismiss_load { self.config_load_error = None; }
+        if dismiss_save { self.save_error = None; }
+    }
+
     fn render_main(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(BG_BASE))
             .show(ctx, |ui| {
+                self.render_banners(ui);
                 // Dashboard is the root view.
                 // Log and Configure are full-screen overlays with their own ← Back header.
                 if let Some(edit) = self.edit.clone() {
@@ -1724,14 +2071,10 @@ impl ProConductor {
                                         let all_stopped = g_running == 0;
                                         let all_running = g_running == g_total && g_total > 0;
 
-                                        if ui.add_enabled(!all_stopped, egui::Button::new(
-                                            RichText::new("Stop group").size(11.0).color(if all_stopped { RED_DIM } else { RED }))
-                                            .fill(RED_BG).stroke(Stroke::new(1.0, if all_stopped { RED_DIM } else { RED })))
+                                        if action_button(ui, BtnKind::Caution, "Stop group", 11.0, 0.0, !all_stopped)
                                             .clicked() { do_stop_group = true; }
 
-                                        if ui.add_enabled(!all_running, egui::Button::new(
-                                            RichText::new("Start group").size(11.0).color(if all_running { GREEN_DIM } else { GREEN }))
-                                            .fill(GREEN_BG).stroke(Stroke::new(1.0, if all_running { GREEN_DIM } else { GREEN })))
+                                        if action_button(ui, BtnKind::Positive, "Start group", 11.0, 0.0, !all_running)
                                             .clicked() { do_start_group = true; }
                                     });
                                 });
@@ -1765,7 +2108,12 @@ impl ProConductor {
         let stop_started = self.stopping.get(cid).copied();
         let handle_info  = self.running.get(cid).map(|h| (h.pid, h.started_at));
         let is_sel       = self.selected_comp.as_deref() == Some(cid);
-        let border_color = if is_stopping { AMBER_DIM } else if is_running { GREEN_DIM } else { BORDER };
+        let crash_code   = (!is_running && !is_stopping)
+            .then(|| self.last_exit.get(cid).copied()).flatten();
+        let border_color = if is_stopping { AMBER_DIM }
+                           else if is_running { GREEN_DIM }
+                           else if crash_code.is_some() { RED_DIM }
+                           else { BORDER };
         let bg           = if is_sel { BG_SEL } else { BG_CARD };
 
         let mut do_start     = false;
@@ -1795,11 +2143,15 @@ impl ProConductor {
                     // LEFT: status dot + name/meta — does NOT use remaining width greedy
                     let (r, painter) = ui.allocate_painter(Vec2::splat(12.0), egui::Sense::hover());
                     let center = r.rect.center();
-                    let dot_color = if is_stopping { AMBER } else if is_running { GREEN } else { TEXT_DIM };
+                    let dot_color = if is_stopping { AMBER }
+                                    else if is_running { GREEN }
+                                    else if crash_code.is_some() { RED }
+                                    else { TEXT_DIM };
                     painter.circle_filled(center, 5.0, dot_color);
-                    if is_running || is_stopping {
+                    if is_running || is_stopping || crash_code.is_some() {
                         let glow = if is_stopping { Color32::from_rgba_premultiplied(240,160,48,60) }
-                                   else           { Color32::from_rgba_premultiplied(33,212,126,60) };
+                                   else if is_running { Color32::from_rgba_premultiplied(33,212,126,60) }
+                                   else { Color32::from_rgba_premultiplied(240,74,94,60) };
                         painter.circle_stroke(center, 7.0, Stroke::new(1.0, glow));
                     }
 
@@ -1810,8 +2162,9 @@ impl ProConductor {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new(&comp.name).size(13.0).strong().color(TEXT_PRI));
                                 if is_stopping {
+                                    let grace_secs = GRACE_PERIOD_MS as f32 / 1000.0;
                                     let elapsed = stop_started.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
-                                    let progress = (elapsed / 8.0).min(1.0);
+                                    let progress = (elapsed / grace_secs).min(1.0);
                                     egui::Frame::none().fill(AMBER_BG).rounding(4.0)
                                         .stroke(Stroke::new(1.0, AMBER_DIM))
                                         .inner_margin(egui::Margin::symmetric(6.0, 2.0))
@@ -1826,7 +2179,7 @@ impl ProConductor {
                                                 let mut fill = bar_rect;
                                                 fill.set_right(bar_rect.left() + bar_rect.width() * progress);
                                                 painter.rect_filled(fill, 2.0, AMBER);
-                                                let secs_left = (8.0 - elapsed).max(0.0).ceil() as u32;
+                                                let secs_left = (grace_secs - elapsed).max(0.0).ceil() as u32;
                                                 ui.label(RichText::new(format!("{}s", secs_left)).size(9.0).color(AMBER_DIM));
                                             });
                                         });
@@ -1841,6 +2194,16 @@ impl ProConductor {
                                         ui.label(RichText::new(format!("PID {}", pid)).size(9.0).color(TEXT_MUTED).monospace());
                                         ui.label(RichText::new(format_uptime(started)).size(10.0).color(GREEN));
                                     }
+                                } else if let Some(code) = crash_code {
+                                    // Nonzero exit — visibly different from a clean stop
+                                    egui::Frame::none().fill(RED_BG).rounding(4.0)
+                                        .stroke(Stroke::new(1.0, RED_DIM))
+                                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                        .show(ui, |ui| {
+                                            let what = if code < 0 { format!("CRASHED (signal {})", -code) }
+                                                       else        { format!("CRASHED (code {})", code) };
+                                            ui.label(RichText::new(what).size(9.0).color(RED).strong());
+                                        });
                                 } else {
                                     egui::Frame::none().fill(BG_BASE).rounding(4.0)
                                         .stroke(Stroke::new(1.0, BORDER))
@@ -1853,15 +2216,19 @@ impl ProConductor {
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing.x = 12.0;
                                 if !comp.executable.is_empty() {
-                                    let exe = comp.executable.split(&['/', '\\'][..]).last().unwrap_or(&comp.executable);
+                                    let exe = comp.executable.rsplit(&['/', '\\'][..]).next().unwrap_or(&comp.executable);
                                     meta_item(ui, "exe", exe);
                                 }
                                 if !comp.working_dir.is_empty() {
-                                    let dir = comp.working_dir.split(&['/', '\\'][..]).last().unwrap_or(&comp.working_dir);
+                                    let dir = comp.working_dir.rsplit(&['/', '\\'][..]).next().unwrap_or(&comp.working_dir);
                                     meta_item(ui, "dir", dir);
                                 }
                                 if !comp.args.is_empty() {
-                                    let short = if comp.args.len() > 36 { format!("{}…", &comp.args[..36]) } else { comp.args.clone() };
+                                    // Truncate on char boundaries — a byte slice
+                                    // panics on multibyte args
+                                    let short = if comp.args.chars().count() > 36 {
+                                        format!("{}…", comp.args.chars().take(36).collect::<String>())
+                                    } else { comp.args.clone() };
                                     meta_item(ui, "args", &short);
                                 }
                             });
@@ -1872,17 +2239,18 @@ impl ProConductor {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().button_padding = Vec2::new(8.0, 5.0);
 
-                        // Delete — disabled while running, always confirms
-                        let del_btn = egui::Button::new(RichText::new("Delete").size(11.0).color(if is_running { TEXT_DIM } else { RED }))
-                            .fill(if is_running { BG_PANEL } else { RED_BG })
-                            .stroke(Stroke::new(1.0, if is_running { BORDER } else { RED_DIM }));
-                        if ui.add_enabled(!is_running, del_btn)
-                            .on_hover_text(if is_running { "Stop the process first" } else { "Delete component" })
+                        // Delete — ghost-red until hover (rare destructive action,
+                        // not a permanent alarm), disabled while running, confirms.
+                        if action_button(ui, BtnKind::Destructive, "Delete", 11.0, 0.0, !is_running)
+                            .on_hover_text("Delete component")
+                            .on_disabled_hover_text("Stop the process first")
                             .clicked() { do_delete = true; }
 
-                        // Configure
-                        if ui.add(egui::Button::new(RichText::new("Config").size(11.0).color(TEXT_MUTED))
-                            .fill(BG_PANEL).stroke(Stroke::new(1.0, BORDER)))
+                        // Dead zone so a slip on Config can't land on Delete
+                        ui.add_space(10.0);
+
+                        // Configure — enabled neutral, not the disabled-looking gray
+                        if action_button(ui, BtnKind::Neutral, "Config", 11.0, 0.0, true)
                             .on_hover_text("Configure component").clicked() { do_configure = true; }
 
                         // Open log file — resolved path
@@ -1890,30 +2258,37 @@ impl ProConductor {
                             let base_dir = self.config_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
                             let resolved = resolve_log_path(&comp.log_path, &comp.name, &base_dir)
                                 .map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-                            if ui.add(egui::Button::new(RichText::new("Log file").size(11.0).color(TEXT_SEC))
-                                .fill(BG_PANEL).stroke(Stroke::new(1.0, BORDER)))
+                            if action_button(ui, BtnKind::Neutral, "Log file", 11.0, 0.0, true)
                                 .on_hover_text(&resolved).clicked() { do_open_log = true; }
                         }
 
-                        // View logs in-app
+                        // View logs in-app — outline accent (navigation, not the
+                        // primary action); fixed width so the live count can't
+                        // shift the row under the cursor.
                         let log_count = self.logs.get(cid).map(|l| l.len()).unwrap_or(0);
                         let log_lbl = if log_count > 0 { format!("Logs ({})", log_count) } else { "Logs".into() };
-                        if ui.add(egui::Button::new(RichText::new(log_lbl).size(11.0).color(BLUE))
-                            .fill(BLUE_DIM).stroke(Stroke::new(1.0, Color32::from_rgb(30, 50, 120))))
+                        if action_button(ui, BtnKind::Accent, &log_lbl, 11.0, 86.0, true)
                             .on_hover_text("View live log output").clicked() { do_log = true; }
 
-                        // Start / Stop
+                        // Start / Stop / Stopping… — one fixed-width slot.
+                        // Stop is amber (interrupt), never Delete's red.
                         if is_stopping {
                             ui.add_enabled(false, egui::Button::new(
                                 RichText::new("Stopping…").size(11.0).color(AMBER))
-                                .fill(AMBER_BG).stroke(Stroke::new(1.0, AMBER_DIM)));
+                                .fill(AMBER_BG).stroke(Stroke::new(1.0, AMBER_DIM))
+                                .min_size(Vec2::new(72.0, 0.0)))
+                                .on_disabled_hover_text("Waiting for the process to exit");
                         } else if is_running {
-                            if ui.add(egui::Button::new(RichText::new("Stop").size(11.0).color(RED))
-                                .fill(RED_BG).stroke(Stroke::new(1.0, RED_DIM))).clicked() { do_stop = true; }
-                        } else {
-                            if ui.add(egui::Button::new(RichText::new("Start").size(11.0).color(GREEN))
-                                .fill(GREEN_BG).stroke(Stroke::new(1.0, GREEN_DIM))).clicked() { do_start = true; }
-                        }
+                            // Brief disable right after start so a double-click on
+                            // Start can't land on the freshly-rendered Stop
+                            let just_started = handle_info
+                                .map(|(_, s)| s.elapsed() < Duration::from_millis(600))
+                                .unwrap_or(false);
+                            if action_button(ui, BtnKind::Caution, "Stop", 11.0, 72.0, !just_started)
+                                .on_disabled_hover_text("Just started…")
+                                .clicked() { do_stop = true; }
+                        } else if action_button(ui, BtnKind::Positive, "Start", 11.0, 72.0, true)
+                            .clicked() { do_start = true; }
                     });
                 });
             });
@@ -1943,8 +2318,7 @@ impl ProConductor {
             self.config.groups.iter().flat_map(|g| g.components.iter()).find(|c| c.id == *id).cloned()
         }) { Some(c) => c, None => { self.view = MainView::Dashboard; self.render_dashboard(ui); return; } };
 
-        let logs = self.logs.get(&comp.id).cloned().unwrap_or_default();
-        let filter = self.log_filter.clone();
+        let log_count = self.logs.get(&comp.id).map(|l| l.len()).unwrap_or(0);
 
         let base_dir = self.config_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
         let resolved_log = resolve_log_path(&comp.log_path, &comp.name, &base_dir)
@@ -1977,10 +2351,14 @@ impl ProConductor {
                                 do_open = true;
                             }
                         }
-                        if ui.small_button(RichText::new("Clear").size(11.0).color(TEXT_MUTED)).clicked() {
+                        // Clear is destructive (drops the in-app buffer) — ghost-red,
+                        // never the disabled-looking gray it had before.
+                        if action_button(ui, BtnKind::Destructive, "Clear", 11.0, 0.0, log_count > 0)
+                            .on_hover_text("Clear the in-app log buffer (the log file on disk is kept)")
+                            .clicked() {
                             do_clear = true;
                         }
-                        ui.checkbox(&mut self.log_autoscroll, RichText::new("Auto-scroll").size(11.0).color(TEXT_MUTED));
+                        ui.checkbox(&mut self.log_autoscroll, RichText::new("Auto-scroll").size(11.0).color(TEXT_SEC));
                         ui.add(egui::TextEdit::singleline(&mut self.log_filter)
                             .hint_text("Filter…")
                             .desired_width(150.0)
@@ -1988,7 +2366,7 @@ impl ProConductor {
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             ui.label(RichText::new(&comp.name).size(12.0).color(TEXT_PRI).strong());
                             ui.label(RichText::new("— Logs").size(11.0).color(TEXT_MUTED));
-                            ui.label(RichText::new(format!("({} lines)", logs.len())).size(10.0).color(TEXT_DIM));
+                            ui.label(RichText::new(format!("({} lines)", log_count)).size(10.0).color(TEXT_DIM));
                         });
                     });
                 });
@@ -2002,76 +2380,41 @@ impl ProConductor {
         // Log output — both axes scrollable, syntax-highlighted via span pipeline
         let font_id = egui::FontId::new(11.5, egui::FontFamily::Monospace);
 
+        let filter = self.log_filter.to_lowercase();
+        let empty: Vec<LogLine> = Vec::new();
+        let logs = self.logs.get(&comp.id).unwrap_or(&empty);
+        let filtered: Vec<&LogLine> = logs.iter()
+            .filter(|l| filter.is_empty() || l.text.to_lowercase().contains(&filter))
+            .collect();
+
+        if filtered.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                let msg = if logs.is_empty() { "No output yet — start the component to see logs." }
+                          else                { "No lines match the filter." };
+                ui.label(RichText::new(msg).size(11.0).color(TEXT_DIM).monospace());
+            });
+            return;
+        }
+
+        // Content width: widest line in the buffer (monospace), not a hardcoded
+        // 4096px — no permanent horizontal scrollbar on short logs.
+        let char_w = ui.fonts(|f| f.glyph_width(&font_id, 'M'));
+        let prefix_chars = 8 + 2 + 3 + 1; // "HH:MM:SS" + gap + tag + gap
+        let max_chars = filtered.iter().map(|l| l.text.chars().count()).max().unwrap_or(0) + prefix_chars;
+        let content_w = (max_chars as f32) * char_w + 24.0;
+        let row_h = ui.fonts(|f| f.row_height(&font_id));
+
+        // Virtualized: only visible rows are highlighted and laid out, instead
+        // of re-rendering the whole 5000-line buffer every frame.
         egui::ScrollArea::both()
             .stick_to_bottom(self.log_autoscroll)
             .auto_shrink([false; 2])
-            .show(ui, |ui| {
-                // Allow content to be wider than the viewport so horizontal scroll works.
-                // Without this egui clips every row to available_width.
-                ui.set_min_width(ui.available_width().max(4096.0));
+            .show_rows(ui, row_h, filtered.len(), |ui, range| {
+                ui.set_min_width(ui.available_width().max(content_w));
                 ui.style_mut().wrap = Some(false);
-                for line in &logs {
-                    if !filter.is_empty() && !line.text.to_lowercase().contains(&filter.to_lowercase()) {
-                        continue;
-                    }
-
-                    let is_real_error = line.source == Source::Stderr && {
-                        let l = line.text.to_lowercase();
-                        l.contains("error") || l.contains("exception") || l.contains("traceback")
-                        || l.contains("fatal") || l.contains("panic") || l.contains("critical")
-                        || l.starts_with("  file \"")
-                    };
-
-                    let base_color = if is_real_error { Color32::from_rgb(240, 120, 130) } else { TEXT_PRI };
-
-                    // Render the entire line as ONE LayoutJob — timestamp + source tag + text.
-                    // Using ui.horizontal() splits the row into multiple widgets; egui clips
-                    // each to available_width so the scrollbar never has anything to scroll.
-                    // A single label with a composite job extends as far as the text needs.
-                    let dim_fmt   = egui::text::TextFormat { font_id: font_id.clone(), color: TEXT_DIM,  ..Default::default() };
-                    let space_fmt = egui::text::TextFormat { font_id: font_id.clone(), color: TEXT_DIM,  ..Default::default() };
-                    let src_color = match line.source {
-                        Source::Stdout => BLUE,
-                        Source::Stderr => if is_real_error { RED } else { TEXT_MUTED },
-                        Source::System => AMBER,
-                    };
-                    let src_text = match line.source {
-                        Source::Stdout => "OUT",
-                        Source::Stderr => "ERR",
-                        Source::System => "SYS",
-                    };
-                    let src_fmt = egui::text::TextFormat {
-                        font_id: font_id.clone(), color: src_color,
-                        ..Default::default()
-                    };
-
-                    let mut job = highlight_log_line(&line.text, base_color, &font_id);
-                    // Prepend timestamp and source tag into the same job
-                    let text_part = std::mem::take(&mut job.text);
-                    let sections  = std::mem::take(&mut job.sections);
-                    let prefix    = format!("{}  {} ", line.time, src_text);
-                    let mut full_job = egui::text::LayoutJob::default();
-                    full_job.wrap.max_width = f32::INFINITY;
-                    full_job.append(&line.time, 0.0, dim_fmt);
-                    full_job.append("  ", 0.0, space_fmt.clone());
-                    full_job.append(src_text, 0.0, src_fmt);
-                    full_job.append(" ", 0.0, space_fmt);
-                    // Re-add the highlighted text sections
-                    let offset = full_job.text.len();
-                    full_job.text.push_str(&text_part);
-                    for mut s in sections {
-                        s.byte_range.start += offset;
-                        s.byte_range.end   += offset;
-                        full_job.sections.push(s);
-                    }
-                    let _ = prefix; // suppress unused warning
-                    ui.label(full_job);
-                }
-                if logs.is_empty() {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        ui.label(RichText::new("No output yet — start the component to see logs.").size(11.0).color(TEXT_DIM).monospace());
-                    });
+                for line in &filtered[range] {
+                    ui.label(log_line_job(line, &font_id));
                 }
             });
     }
@@ -2097,14 +2440,11 @@ impl ProConductor {
                     }
                     // Right-side buttons — must be added before the expanding label
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if !edit.is_new {
-                            if ui.add(egui::Button::new(RichText::new("Delete").size(12.0).color(RED))
-                                .fill(RED_BG).stroke(Stroke::new(1.0, RED_DIM))).clicked() {
-                                do_delete = true;
-                            }
+                        if !edit.is_new
+                            && action_button(ui, BtnKind::Destructive, "Delete", 12.0, 0.0, true).clicked() {
+                            do_delete = true;
                         }
-                        if ui.add(egui::Button::new(RichText::new("Save").size(12.0).color(GREEN))
-                            .fill(GREEN_BG).stroke(Stroke::new(1.0, GREEN_DIM))).clicked() {
+                        if action_button(ui, BtnKind::Positive, "Save", 12.0, 0.0, true).clicked() {
                             do_save = true;
                         }
                         // Title fills leftover space between Back and the right buttons
@@ -2141,8 +2481,7 @@ impl ProConductor {
                     }
                 }
             }
-            save_config(&self.config, &self.config_path);
-            self.dirty = false;
+            self.persist();
             self.edit  = None;
             self.view  = MainView::Dashboard;
             return;
@@ -2150,9 +2489,10 @@ impl ProConductor {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(12.0);
+            // NOTE: edits here go into the edit BUFFER (a clone), not the live
+            // config — so they must NOT set self.dirty. The config only changes
+            // on Save, which persists immediately.
             let c = &mut edit.component;
-            let p = self.config_path.clone();
-            let dirty = &mut self.dirty;
 
             egui::Frame::none()
                 .inner_margin(egui::Margin::symmetric(24.0, 0.0))
@@ -2161,7 +2501,7 @@ impl ProConductor {
                     section_title(ui, "IDENTITY");
                     ui.add_space(4.0);
                     field_row(ui, "Display Name", |ui| {
-                        if ui.add(egui::TextEdit::singleline(&mut c.name).hint_text("e.g. API Server")).changed() { *dirty = true; }
+                        ui.add(egui::TextEdit::singleline(&mut c.name).hint_text("e.g. API Server"));
                     });
 
                     ui.add_space(14.0);
@@ -2171,25 +2511,25 @@ impl ProConductor {
                     field_row(ui, "Executable", |ui| {
                         if ui.small_button("Browse").clicked() {
                             if let Some(p) = rfd::FileDialog::new().set_title("Select Executable").pick_file() {
-                                c.executable = p.to_string_lossy().to_string(); *dirty = true;
+                                c.executable = p.to_string_lossy().to_string();
                             }
                         }
-                        if ui.add(egui::TextEdit::singleline(&mut c.executable)
+                        ui.add(egui::TextEdit::singleline(&mut c.executable)
                             .hint_text(if cfg!(windows) { r"C:\path\to\app.exe" } else { "/usr/bin/node" })
-                            .desired_width(ui.available_width())).changed() { *dirty = true; }
+                            .desired_width(ui.available_width()));
                     });
                     field_row(ui, "Arguments", |ui| {
-                        if ui.add(egui::TextEdit::singleline(&mut c.args).hint_text(r#"--port 8080 --config "my config.json""#).desired_width(f32::INFINITY)).changed() { *dirty = true; }
+                        ui.add(egui::TextEdit::singleline(&mut c.args).hint_text(r#"--port 8080 --config "my config.json""#).desired_width(f32::INFINITY));
                     });
                     field_row(ui, "Working Dir", |ui| {
                         if ui.small_button("Browse").clicked() {
                             if let Some(p) = rfd::FileDialog::new().set_title("Select Working Directory").pick_folder() {
-                                c.working_dir = p.to_string_lossy().to_string(); *dirty = true;
+                                c.working_dir = p.to_string_lossy().to_string();
                             }
                         }
-                        if ui.add(egui::TextEdit::singleline(&mut c.working_dir)
+                        ui.add(egui::TextEdit::singleline(&mut c.working_dir)
                             .hint_text(if cfg!(windows) { r"C:\projects\myapp" } else { "/opt/myapp" })
-                            .desired_width(ui.available_width())).changed() { *dirty = true; }
+                            .desired_width(ui.available_width()));
                     });
 
                     ui.add_space(14.0);
@@ -2200,12 +2540,12 @@ impl ProConductor {
                         if ui.small_button("Browse").clicked() {
                             if let Some(p) = rfd::FileDialog::new()
                                 .add_filter("Log", &["log","txt"]).save_file() {
-                                c.log_path = p.to_string_lossy().to_string(); *dirty = true;
+                                c.log_path = p.to_string_lossy().to_string();
                             }
                         }
-                        if ui.add(egui::TextEdit::singleline(&mut c.log_path)
+                        ui.add(egui::TextEdit::singleline(&mut c.log_path)
                             .hint_text(if cfg!(windows) { r"C:\logs\{name}-{date}.log" } else { "/var/log/{name}-{date}.log" })
-                            .desired_width(ui.available_width())).changed() { *dirty = true; }
+                            .desired_width(ui.available_width()));
                     });
 
                     ui.add_space(14.0);
@@ -2213,7 +2553,7 @@ impl ProConductor {
                     ui.add_space(4.0);
                     field_row(ui, "Run as User", |ui| {
                         ui.label(RichText::new("Unix: sudo -u").size(9.0).color(TEXT_DIM));
-                        if ui.add(egui::TextEdit::singleline(&mut c.run_as_user).hint_text("e.g. www-data").desired_width(200.0)).changed() { *dirty = true; }
+                        ui.add(egui::TextEdit::singleline(&mut c.run_as_user).hint_text("e.g. www-data").desired_width(200.0));
                     });
 
                     ui.add_space(14.0);
@@ -2232,24 +2572,23 @@ impl ProConductor {
                     let mut to_delete: Option<usize> = None;
                     for (i, ev) in c.env_vars.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
-                            if ui.small_button(RichText::new("✕").size(10.0).color(RED_DIM)).clicked() {
+                            if ui.small_button(RichText::new("✕").size(10.0).color(RED_GHOST)).clicked() {
                                 to_delete = Some(i);
                             }
                             let w = (ui.available_width() - 8.0) / 2.0;
-                            if ui.add(egui::TextEdit::singleline(&mut ev.key).hint_text("KEY").desired_width(w)).changed() { *dirty = true; }
-                            if ui.add(egui::TextEdit::singleline(&mut ev.value).hint_text("value").desired_width(w)).changed() { *dirty = true; }
+                            ui.add(egui::TextEdit::singleline(&mut ev.key).hint_text("KEY").desired_width(w));
+                            ui.add(egui::TextEdit::singleline(&mut ev.value).hint_text("value").desired_width(w));
                         });
                     }
-                    if let Some(idx) = to_delete { c.env_vars.remove(idx); *dirty = true; }
+                    if let Some(idx) = to_delete { c.env_vars.remove(idx); }
 
                     ui.add_space(4.0);
                     if ui.small_button(RichText::new("+ Add Variable").size(11.0).color(TEXT_SEC)).clicked() {
-                        c.env_vars.push(EnvVar::default()); *dirty = true;
+                        c.env_vars.push(EnvVar::default());
                     }
 
                     ui.add_space(24.0);
                 });
-            _ = p; // suppress unused warning
         });
 
         self.edit = Some(edit);
@@ -2260,14 +2599,43 @@ impl ProConductor {
     fn render_confirm_dialog(&mut self, ctx: &egui::Context) {
         let Some((kind, id)) = self.confirm_delete.clone() else { return };
 
-        // Resolve display name
-        let display_name = if kind == "group" {
-            self.config.groups.iter().find(|g| g.id == id).map(|g| g.name.clone()).unwrap_or_default()
-        } else {
-            self.config.groups.iter().flat_map(|g| g.components.iter()).find(|c| c.id == id).map(|c| c.name.clone()).unwrap_or_default()
-        };
+        // Esc cancels
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.confirm_delete = None;
+            return;
+        }
 
-        egui::Window::new(format!("Delete {}?", kind))
+        // Resolve display name + which processes the delete would affect
+        let (display_name, affected_ids) = if kind == "group" {
+            let g = self.config.groups.iter().find(|g| g.id == id);
+            (
+                g.map(|g| g.name.clone()).unwrap_or_default(),
+                g.map(|g| g.components.iter().map(|c| c.id.clone()).collect::<Vec<_>>()).unwrap_or_default(),
+            )
+        } else {
+            (
+                self.config.groups.iter().flat_map(|g| g.components.iter())
+                    .find(|c| c.id == id).map(|c| c.name.clone()).unwrap_or_default(),
+                vec![id.clone()],
+            )
+        };
+        let running_affected = affected_ids.iter().filter(|i| self.running.contains_key(*i)).count();
+
+        // Modal shield: a full-screen click-eating dim layer so the background
+        // UI can't be interacted with (or swap the pending target) mid-dialog.
+        // Clicking the shield cancels, like Esc.
+        let mut shield_clicked = false;
+        egui::Area::new(egui::Id::new("modal_shield"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let screen = ui.ctx().screen_rect();
+                let resp = ui.allocate_response(screen.size(), egui::Sense::click());
+                ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(120));
+                if resp.clicked() { shield_clicked = true; }
+            });
+
+        let win = egui::Window::new(format!("Delete {}?", kind))
             .collapsible(false).resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(egui::Frame::none().fill(BG_CARD).rounding(8.0).stroke(Stroke::new(1.0, BORDER_HI)).inner_margin(egui::Margin::same(20.0)))
@@ -2275,6 +2643,13 @@ impl ProConductor {
                 ui.label(RichText::new(format!("\"{}\"", display_name)).size(13.0).color(TEXT_PRI).strong());
                 ui.add_space(6.0);
                 ui.label(RichText::new("This will permanently remove it from the config.").size(11.0).color(TEXT_SEC));
+                if running_affected > 0 {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!(
+                        "{} running process{} will be stopped.",
+                        running_affected, if running_affected == 1 { "" } else { "es" }
+                    )).size(11.0).color(AMBER));
+                }
                 ui.add_space(14.0);
                 // Cancel first so it gets a real rect (right-to-left would squeeze it)
                 ui.horizontal(|ui| {
@@ -2282,9 +2657,16 @@ impl ProConductor {
                         .min_size(Vec2::new(80.0, 0.0))).clicked() {
                         self.confirm_delete = None;
                     }
+                    // Filled red here is intentional — the user is already in a
+                    // confirmation context.
                     if ui.add(egui::Button::new(RichText::new("Delete").size(12.0).color(RED))
                         .fill(RED_BG).stroke(Stroke::new(1.0, RED_DIM))
                         .min_size(Vec2::new(80.0, 0.0))).clicked() {
+                        // Stop any live processes first so they aren't orphaned
+                        // the moment their config entry disappears.
+                        for cid in &affected_ids {
+                            if self.running.contains_key(cid) { self.stop(cid); }
+                        }
                         if kind == "group" {
                             self.config.groups.retain(|g| g.id != id);
                             if self.selected_group.as_deref() == Some(&id) { self.selected_group = None; }
@@ -2294,16 +2676,70 @@ impl ProConductor {
                             }
                             if self.selected_comp.as_deref() == Some(&id) { self.selected_comp = None; }
                         }
-                        save_config(&self.config, &self.config_path);
+                        self.persist();
                         self.confirm_delete = None;
                         self.edit = None;
                     }
                 });
             });
+
+        // Keep the dialog above the shield
+        if let Some(w) = win { ctx.move_to_top(w.response.layer_id); }
+        if shield_clicked { self.confirm_delete = None; }
     }
 }
 
 // ── UI helpers ─────────────────────────────────────────────────────────────
+
+/// Semantic button kinds — one color trio per state, defined in one place so
+/// call sites can't drift. Color rules:
+///   red is exclusively destructive (Delete/Clear), amber = interrupt (Stop),
+///   green = positive (Start/Save), blue = navigation accent (Logs),
+///   neutral = TEXT_SEC or brighter; TEXT_DIM + no fill/stroke = disabled only.
+#[derive(Clone, Copy)]
+enum BtnKind {
+    Positive,    // Start / Save — filled green
+    Caution,     // Stop — amber, chains into the amber "Stopping…" state
+    Destructive, // Delete / Clear — ghost at rest, alarm red only on hover
+    Accent,      // Logs — outline accent, must not outshine Start/Stop
+    Neutral,     // Config / Log file — clearly enabled, never disabled-gray
+}
+
+fn action_button(ui: &mut egui::Ui, kind: BtnKind, label: &str, size: f32, min_w: f32, enabled: bool) -> egui::Response {
+    ui.scope(|ui| {
+        // (text, fill, border) at rest and on hover/press
+        let (rest, hover) = match kind {
+            BtnKind::Positive    => ((GREEN,     GREEN_BG,             GREEN_DIM), (GREEN,    GREEN_BG_HOVER, GREEN)),
+            BtnKind::Caution     => ((AMBER,     AMBER_BG,             AMBER_DIM), (AMBER,    AMBER_BG_HOVER, AMBER)),
+            BtnKind::Destructive => ((RED_GHOST, Color32::TRANSPARENT, BORDER),    (RED,      RED_BG,         RED_DIM)),
+            BtnKind::Accent      => ((BLUE,      Color32::TRANSPARENT, BORDER),    (BLUE_HI,  BLUE_DIM,       BLUE_BORDER)),
+            BtnKind::Neutral     => ((TEXT_SEC,  BG_PANEL,             BORDER),    (TEXT_PRI, BG_HOVER,       BORDER_HI)),
+        };
+        let v = ui.visuals_mut();
+        // The app sets a global override_text_color; clear it so the label
+        // follows the per-state fg_stroke (hover brightens text too).
+        v.override_text_color = None;
+        let set = |w: &mut egui::style::WidgetVisuals, (fg, bg, bd): (Color32, Color32, Color32)| {
+            w.weak_bg_fill = bg;
+            w.bg_fill      = bg;
+            w.fg_stroke    = Stroke::new(1.0, fg);
+            w.bg_stroke    = Stroke::new(1.0, bd);
+        };
+        set(&mut v.widgets.inactive, rest);
+        set(&mut v.widgets.hovered, hover);
+        set(&mut v.widgets.active, hover);
+        // Disabled: a visible but clearly inert slot — dim text on the neutral
+        // panel fill. (Fully transparent disabled buttons made rows look broken:
+        // an invisible "Stop All" just left a mystery gap in the layout.)
+        set(&mut v.widgets.noninteractive, (TEXT_DIM, BG_PANEL, BORDER));
+
+        let mut btn = egui::Button::new(RichText::new(label).size(size));
+        // Fixed footprint where labels morph (Start↔Stop, "Logs (N)") so the
+        // row doesn't shift under the cursor.
+        if min_w > 0.0 { btn = btn.min_size(Vec2::new(min_w, 0.0)); }
+        ui.add_enabled(enabled, btn)
+    }).inner
+}
 
 fn section_title(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(9.5).color(TEXT_MUTED).strong());
@@ -2392,7 +2828,10 @@ fn main() -> eframe::Result<()> {
     }
     let config_path = config_path.unwrap_or_else(|| PathBuf::from("proconductor.json"));
 
-    let config = load_config(&config_path);
+    let (mut config, load_error) = load_config(&config_path);
+    // Repair missing/duplicate ids from hand-edited configs; mark dirty so the
+    // repair can be persisted by the user.
+    let ids_repaired = sanitize_config(&mut config);
 
     // Single-instance check per config file using an exclusive OS file lock.
     // The lock is held for the entire process lifetime and released automatically
@@ -2404,7 +2843,7 @@ fn main() -> eframe::Result<()> {
         p
     };
     let lock_file = std::fs::OpenOptions::new()
-        .create(true).write(true).open(&lock_path)
+        .create(true).write(true).truncate(false).open(&lock_path)
         .expect("Could not open lock file");
     match lock_file.try_lock_exclusive() {
         Ok(()) => {} // acquired — this is the only instance for this config
@@ -2430,18 +2869,27 @@ Close that window first.", name);
         }
     }
 
-    let title = format!(
+    #[allow(unused_mut)]
+    let mut title = format!(
         "ProConductor — {}",
         config_path.file_name().unwrap_or_default().to_string_lossy()
     );
+    // Windows: the title is used to locate our HWND via FindWindowW. Two
+    // instances with same-named configs in different directories would collide,
+    // so make it unique. The native titlebar is hidden, nobody sees the suffix.
+    #[cfg(windows)]
+    { title = format!("{} [{}]", title, std::process::id()); }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(&title)
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 580.0])
-            // Windows: remove native title bar — we draw our own in render_topbar
-            .with_decorations(false)
+            // Windows/macOS: remove native title bar — we draw our own in
+            // render_topbar. Linux keeps native decorations: the custom window
+            // controls are not rendered there, so an undecorated window would
+            // have no close/minimize/drag at all.
+            .with_decorations(cfg!(target_os = "linux"))
             .with_icon(eframe::icon_data::from_png_bytes(&[]).unwrap_or_default()),
         ..Default::default()
     };
@@ -2451,17 +2899,19 @@ Close that window first.", name);
     let registry_for_signal = pid_registry.clone();
 
     ctrlc::set_handler(move || {
-        // Kill every registered child PID
+        // Kill every registered child tree: graceful signal to all, a short
+        // shared grace pause, then force-kill — a single SIGTERM would leave
+        // TERM-ignoring children running.
         let pids = registry_for_signal.lock().unwrap().clone();
-        for pid in pids {
-            kill_tree(pid);
-        }
+        for &pid in &pids { graceful_kill_tree(pid); }
+        thread::sleep(Duration::from_millis(500));
+        for &pid in &pids { force_kill_tree(pid); }
         std::process::exit(0);
     }).expect("Failed to set signal handler");
 
     eframe::run_native(
         &title,
         options,
-        Box::new(move |cc| Box::new(ProConductor::new(cc, config, config_path, lock_file, pid_registry, autostart, minimized))),
+        Box::new(move |cc| Box::new(ProConductor::new(cc, config, config_path, lock_file, pid_registry, autostart, minimized, load_error, ids_repaired))),
     )
 }
