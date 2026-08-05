@@ -3,6 +3,7 @@ name        = "proconductor"
 version     = "1.0.0"
 edition     = "2021"
 description = "Multi-component process orchestrator — run as: proconductor [config.json]"
+license     = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "proconductor"
