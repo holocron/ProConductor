@@ -6,12 +6,13 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{mpsc, Arc, Mutex, Weak},
     thread,
     time::{Duration, Instant},
 };
 
 use crate::config::{AppConfig, Component, save_config};
+use crate::control::{self, Action, ControlBus, ControlCommand};
 use crate::process::*;
 use crate::theme::*;
 
@@ -43,6 +44,14 @@ pub(crate) struct RunningProcess {
     pub(crate) started_at: Instant,
     pub(crate) child:      Arc<Mutex<Child>>,
     pub(crate) cancelled:  Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A control-bus reply that can only be written once every targeted
+/// component has finished stopping (and, for restart, started again).
+pub(crate) struct PendingReply {
+    pub(crate) path:      PathBuf,
+    pub(crate) remaining: usize,
+    pub(crate) errors:    Vec<String>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -77,6 +86,13 @@ pub(crate) struct ProConductor {
     pub(crate) running:    HashMap<String, RunningProcess>,
     pub(crate) stopping:   HashMap<String, Instant>,   // id → when stop was requested
     pub(crate) last_exit:  HashMap<String, i32>,       // id → last nonzero exit code (crash badge)
+    // External control bus (None when disabled in config). The watcher thread
+    // reaches the app through `self_weak`, see `AppHandle`.
+    pub(crate) control:         Option<ControlBus>,
+    pub(crate) self_weak:       Weak<Mutex<ProConductor>>,
+    pub(crate) restart_pending: HashSet<String>,       // ids to start again once they are down
+    pub(crate) replies:         Vec<PendingReply>,     // deferred control-bus results
+    pub(crate) reply_waiters:   HashMap<String, Vec<usize>>, // id → indices into `replies`
     pub(crate) logs:       HashMap<String, Vec<LogLine>>,
     pub(crate) event_tx:   mpsc::Sender<AppEvent>,
     pub(crate) event_rx:   mpsc::Receiver<AppEvent>,
@@ -164,6 +180,11 @@ impl ProConductor {
         let mut app = Self {
             config,
             config_path: path,
+            control: None,
+            self_weak: Weak::new(),
+            restart_pending: HashSet::new(),
+            replies: Vec::new(),
+            reply_waiters: HashMap::new(),
             dirty: initial_dirty,
             _lock: lock,
             pid_registry,
@@ -205,6 +226,22 @@ impl ProConductor {
         set_dock_icon(DOCK_ICON_RED, DOCK_ICON_W, DOCK_ICON_H);
 
         app
+    }
+
+    /// Called once the app lives inside its `Arc<Mutex<_>>`: remembers the
+    /// handle and starts the control bus (if enabled).
+    pub(crate) fn attach(&mut self, weak: Weak<Mutex<ProConductor>>) {
+        self.self_weak = weak;
+        self.reload_control();
+    }
+
+    /// (Re)create the control bus to match the current config.
+    fn reload_control(&mut self) {
+        let want = control::control_dir_for(&self.config, &self.config_path);
+        let have = self.control.as_ref().map(|b| b.dir().to_path_buf());
+        if want == have && self.control.is_some() == want.is_some() { return; }
+        self.control = None; // stop the old watcher before starting a new one
+        self.control = want.map(|d| ControlBus::new(d, self.self_weak.clone(), self.ctx_handle.clone()));
     }
 
     // ── Process spawning ───────────────────────────────────────────────────
@@ -451,6 +488,170 @@ impl ProConductor {
         for id in ids { self.stop(&id); }
     }
 
+    /// Stop, then start again as soon as the process is confirmed dead. A
+    /// component that isn't running is simply started.
+    pub(crate) fn restart(&mut self, id: &str) {
+        if self.running.contains_key(id) {
+            self.restart_pending.insert(id.to_string());
+            self.stop(id);
+        } else if !self.stopping.contains_key(id) {
+            if let Some(c) = self.find_component(id) { self.start(&c); }
+        } else {
+            // Already on its way down — just make sure it comes back.
+            self.restart_pending.insert(id.to_string());
+        }
+    }
+
+    pub(crate) fn find_component(&self, id: &str) -> Option<Component> {
+        self.config.groups.iter().flat_map(|g| g.components.iter()).find(|c| c.id == id).cloned()
+    }
+
+    /// Called whenever a component is confirmed down (clean stop or exit):
+    /// completes a pending restart and unblocks control-bus replies.
+    fn on_component_down(&mut self, id: &str) {
+        if self.restart_pending.remove(id) {
+            if let Some(c) = self.find_component(id) {
+                self.start(&c);
+                let ok = self.running.contains_key(id);
+                self.settle_waiters(id, if ok { None } else { Some(format!("{}: failed to start after stop", c.name)) });
+                return;
+            }
+        }
+        self.settle_waiters(id, None);
+    }
+
+    fn settle_waiters(&mut self, id: &str, error: Option<String>) {
+        let Some(idxs) = self.reply_waiters.remove(id) else { return };
+        for i in idxs {
+            if let Some(r) = self.replies.get_mut(i) {
+                if let Some(e) = &error { r.errors.push(e.clone()); }
+                r.remaining = r.remaining.saturating_sub(1);
+            }
+        }
+        self.flush_replies();
+    }
+
+    fn flush_replies(&mut self) {
+        let mut i = 0;
+        while i < self.replies.len() {
+            if self.replies[i].remaining == 0 {
+                let r = self.replies.remove(i);
+                // Indices above `i` shifted down by one.
+                for v in self.reply_waiters.values_mut() {
+                    for idx in v.iter_mut() { if *idx > i { *idx -= 1; } }
+                }
+                if r.errors.is_empty() { control::write_result(&r.path, true, "done"); }
+                else { control::write_result(&r.path, false, &r.errors.join("; ")); }
+            } else { i += 1; }
+        }
+    }
+
+    // ── External control bus ─────────────────────────────────────────────
+
+    /// Resolve a control-bus target to components. Matches component id/name,
+    /// group id/name, or `all` (case-insensitive names). Components with
+    /// remote control disabled are excluded.
+    fn resolve_targets(&self, target: &str) -> Result<Vec<Component>, String> {
+        let t = target.trim();
+        if t.is_empty() { return Err("Missing target (component name, group name or `all`).".into()); }
+        let all: Vec<Component> = self.config.groups.iter().flat_map(|g| g.components.iter().cloned()).collect();
+        let selected: Vec<Component> = if t.eq_ignore_ascii_case("all") {
+            all
+        } else if let Some(g) = self.config.groups.iter().find(|g| g.id == t || g.name.eq_ignore_ascii_case(t)) {
+            g.components.clone()
+        } else {
+            all.into_iter().filter(|c| c.id == t || c.name.eq_ignore_ascii_case(t)).collect()
+        };
+        if selected.is_empty() { return Err(format!("No component or group named '{}'.", t)); }
+        let allowed: Vec<Component> = selected.iter().filter(|c| c.remote_control).cloned().collect();
+        if allowed.is_empty() {
+            return Err(format!("'{}' has remote control disabled.", t));
+        }
+        Ok(allowed)
+    }
+
+    fn status_json(&self) -> String {
+        let groups: Vec<serde_json::Value> = self.config.groups.iter().map(|g| serde_json::json!({
+            "id": g.id, "name": g.name,
+            "components": g.components.iter().map(|c| {
+                let state = if self.stopping.contains_key(&c.id) { "stopping" }
+                            else if self.running.contains_key(&c.id) { "running" }
+                            else { "stopped" };
+                serde_json::json!({
+                    "id": c.id, "name": c.name, "state": state,
+                    "pid": self.running.get(&c.id).map(|h| h.pid),
+                    "uptime_secs": self.running.get(&c.id).map(|h| h.started_at.elapsed().as_secs()),
+                    "last_exit_code": self.last_exit.get(&c.id),
+                    "remote_control": c.remote_control,
+                })
+            }).collect::<Vec<_>>(),
+        })).collect();
+        serde_json::json!({ "groups": groups }).to_string()
+    }
+
+    pub(crate) fn handle_control_command(&mut self, cmd: ControlCommand) {
+        if !self.config.control.action_allowed(cmd.action.as_str()) {
+            control::write_result(&cmd.path, false,
+                &format!("Action '{}' is not allowed by this config (control.allowed_actions).", cmd.action.as_str()));
+            return;
+        }
+        if cmd.action == Action::Status {
+            control::write_result(&cmd.path, true, &self.status_json());
+            return;
+        }
+        let comps = match self.resolve_targets(&cmd.target) {
+            Ok(c) => c,
+            Err(e) => { control::write_result(&cmd.path, false, &e); return; }
+        };
+        let names: Vec<&str> = comps.iter().map(|c| c.name.as_str()).collect();
+        self.logs.entry(comps[0].id.clone()).or_default().push(LogLine {
+            time: now_hms(), source: Source::System,
+            text: format!("Remote {} requested for {}", cmd.action.as_str(), names.join(", ")),
+        });
+
+        match cmd.action {
+            Action::Start => {
+                let mut errors = vec![];
+                for c in &comps {
+                    if self.stopping.contains_key(&c.id) {
+                        errors.push(format!("{}: still stopping, try again shortly", c.name));
+                        continue;
+                    }
+                    self.start(c);
+                    if !self.running.contains_key(&c.id) { errors.push(format!("{}: failed to start", c.name)); }
+                }
+                if errors.is_empty() { control::write_result(&cmd.path, true, "done"); }
+                else { control::write_result(&cmd.path, false, &errors.join("; ")); }
+            }
+            Action::Stop | Action::Restart => {
+                // Anything that must go down first is awaited; the rest is
+                // settled synchronously.
+                let mut errors = vec![];
+                let mut waiting: Vec<String> = vec![];
+                for c in &comps {
+                    let alive = self.running.contains_key(&c.id) || self.stopping.contains_key(&c.id);
+                    if cmd.action == Action::Stop {
+                        if alive { self.stop(&c.id); waiting.push(c.id.clone()); }
+                    } else {
+                        self.restart(&c.id);
+                        if alive { waiting.push(c.id.clone()); }
+                        else if !self.running.contains_key(&c.id) { errors.push(format!("{}: failed to start", c.name)); }
+                    }
+                }
+                if waiting.is_empty() {
+                    if errors.is_empty() { control::write_result(&cmd.path, true, "done"); }
+                    else { control::write_result(&cmd.path, false, &errors.join("; ")); }
+                } else {
+                    let idx = self.replies.len();
+                    self.replies.push(PendingReply { path: cmd.path, remaining: waiting.len(), errors });
+                    for id in waiting { self.reply_waiters.entry(id).or_default().push(idx); }
+                }
+            }
+            Action::Status => unreachable!(),
+        }
+        self.ctx_handle.request_repaint();
+    }
+
     pub(crate) fn group_running_count(&self, group_id: &str) -> (usize, usize) {
         // returns (running, total)
         let comps = self.config.groups.iter()
@@ -478,12 +679,16 @@ impl ProConductor {
                         }
                         self.stopping.remove(&id);
                         match exit_code {
-                            Some(c) if c != 0 => { self.last_exit.insert(id, c); }
+                            Some(c) if c != 0 => { self.last_exit.insert(id.clone(), c); }
                             _                 => { self.last_exit.remove(&id); }
                         }
+                        self.on_component_down(&id);
                     }
                 }
-                AppEvent::Stopped { id } => { self.stopping.remove(&id); }
+                AppEvent::Stopped { id } => {
+                    self.stopping.remove(&id);
+                    self.on_component_down(&id);
+                }
                 AppEvent::ShowWindow => { self.show_window_requested = true; }
                 AppEvent::QuitApp    => { self.quit_requested        = true; }
             }
@@ -493,7 +698,12 @@ impl ProConductor {
     /// Save the config; on failure keep the dirty flag set and surface the error.
     pub(crate) fn persist(&mut self) {
         match save_config(&self.config, &self.config_path) {
-            Ok(())  => { self.dirty = false; self.save_error = None; }
+            Ok(())  => {
+                self.dirty = false; self.save_error = None;
+                // Control settings may have changed: re-create the bus if its
+                // directory moved or it was switched on/off.
+                self.reload_control();
+            }
             Err(e)  => {
                 self.dirty = true;
                 self.save_error = Some(format!("Failed to save {}: {}", self.config_path.display(), e));
@@ -512,8 +722,35 @@ impl ProConductor {
 // Rendering
 // ══════════════════════════════════════════════════════════════════════════════
 
-impl eframe::App for ProConductor {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+/// eframe owns the app, but the control-bus watcher thread must be able to
+/// act while the window is minimized (no frames are delivered then), so the
+/// real state lives behind a mutex both sides lock.
+pub(crate) struct AppHandle(pub(crate) Arc<Mutex<ProConductor>>);
+
+impl AppHandle {
+    pub(crate) fn new(app: ProConductor) -> Self {
+        let arc = Arc::new(Mutex::new(app));
+        lock_app(&arc).attach(Arc::downgrade(&arc));
+        Self(arc)
+    }
+}
+
+/// Lock that survives poisoning: a panic on one side must not freeze the other.
+pub(crate) fn lock_app(app: &Arc<Mutex<ProConductor>>) -> std::sync::MutexGuard<'_, ProConductor> {
+    app.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl eframe::App for AppHandle {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        lock_app(&self.0).frame(ctx, frame);
+    }
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        lock_app(&self.0).exit();
+    }
+}
+
+impl ProConductor {
+    fn frame(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.start_minimized {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             self.start_minimized = false;
@@ -565,7 +802,7 @@ impl eframe::App for ProConductor {
         self.render_confirm_dialog(ctx);
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn exit(&mut self) {
         // Unsaved config changes must not be silently lost on quit.
         if self.dirty {
             let _ = save_config(&self.config, &self.config_path);

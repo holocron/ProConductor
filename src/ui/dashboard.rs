@@ -137,6 +137,7 @@ impl ProConductor {
 
         let mut do_start     = false;
         let mut do_stop      = false;
+        let mut do_restart   = false;
         let mut do_log       = false;
         let mut do_configure = false;
         let mut do_delete    = false;
@@ -306,6 +307,9 @@ impl ProConductor {
                             if action_button(ui, BtnKind::Caution, "Stop", 11.0, 72.0, !just_started)
                                 .on_disabled_hover_text("Just started…")
                                 .clicked() { do_stop = true; }
+                            if action_button(ui, BtnKind::Accent, "Restart", 11.0, 72.0, !just_started)
+                                .on_hover_text("Stop, wait for exit, start again")
+                                .clicked() { do_restart = true; }
                         } else if action_button(ui, BtnKind::Positive, "Start", 11.0, 72.0, true)
                             .clicked() { do_start = true; }
                     });
@@ -314,6 +318,7 @@ impl ProConductor {
 
         if do_start     { self.start(&comp); }
         if do_stop      { self.stop(cid); }
+        if do_restart   { self.restart(cid); }
         if do_log       { self.selected_comp = Some(cid.to_string()); self.view = MainView::Log; }
         if do_open_log  {
             let base_dir = self.config_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));

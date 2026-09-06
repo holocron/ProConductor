@@ -41,6 +41,7 @@ The config is plain JSON, human-readable and version-control friendly:
           "args": "server.js --port 8080",
           "log_path": "/var/log/myapp/{name}-{date}.log",
           "run_as_user": "",
+          "remote_control": true,
           "env_vars": [
             { "key": "NODE_ENV", "value": "production" },
             { "key": "DB_HOST",  "value": "localhost" }
@@ -48,13 +49,76 @@ The config is plain JSON, human-readable and version-control friendly:
         }
       ]
     }
-  ]
+  ],
+  "control": {
+    "enabled": true,
+    "dir": "",
+    "allowed_actions": []
+  }
 }
 ```
 
 Log path placeholders:
 - `{name}` → component display name
 - `{date}` → `YYYY-MM-DD`
+
+---
+
+## Remote control (CLI, scripts, agents)
+
+A running instance can be driven from outside — e.g. an AI agent that just
+rebuilt your MCP server and wants it restarted. The same binary doubles as the
+client; point it at the same config file:
+
+```bash
+# Stop → wait for exit → start again. Blocks until the process is back up.
+./proconductor production.json --restart "MCP Server"
+
+./proconductor production.json --start  "API Server"
+./proconductor production.json --stop   "Workers"        # group name works too
+./proconductor production.json --restart all
+./proconductor production.json --status                  # JSON: state, pid, uptime, last exit code
+./proconductor production.json --restart api --timeout 60
+```
+
+Targets are matched by component name or id, group name or id, or `all`
+(names case-insensitive). Exit code is `0` on success, `1` on failure or
+timeout (default 30 s); the instance's reply is printed to stdout/stderr, so
+an agent can simply shell out and check the exit code.
+
+### Under the hood — command files
+
+The CLI is a thin client over a file-based bus, so anything that can write a
+file can control ProConductor (cron, systemd hooks, CI, Task Scheduler, another
+language). Next to `production.json` the app watches `production.json.ctl/`:
+
+1. Write a file with a `.tmp` suffix, then rename it to `<anything>.cmd`
+   (the rename makes the write atomic). Content is either one line
+   `restart MCP Server` or JSON `{"action":"restart","target":"MCP Server"}`.
+2. The app consumes the `.cmd` and writes `<anything>.result` containing
+   `{"ok": true|false, "message": "..."}`. For `stop`/`restart` the result
+   appears only once the process is really down / really running again.
+3. Stale results are swept after 10 minutes; commands left over from a
+   previous run are discarded on startup, never replayed.
+
+This works while the window is minimized or hidden in the tray.
+
+### Configuration
+
+Top-level `"control"` block in the config file:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Master switch. `false` = no control directory, CLI reports the instance as unreachable. |
+| `dir` | `""` | Watched directory. Empty = `<config>.ctl` next to the config; relative paths resolve against the config's folder. |
+| `allowed_actions` | `[]` (all) | Subset of `start`, `stop`, `restart`, `status` that clients may issue. |
+
+Per component, `"remote_control": false` (also a checkbox in the Configure
+view) excludes it from remote start/stop/restart — a group- or `all`-wide
+command silently skips it, a direct command is refused.
+
+Anyone with write access to the control directory can start and stop your
+processes; keep its permissions in line with the config file's.
 
 ---
 

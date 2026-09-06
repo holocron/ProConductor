@@ -29,6 +29,35 @@ pub struct Component {
     #[serde(default)] pub log_path:    String,
     #[serde(default)] pub run_as_user: String,
     #[serde(default)] pub env_vars:    Vec<EnvVar>,
+    /// May this component be started/stopped/restarted through the external
+    /// control bus (CLI / command files)? Defaults to true.
+    #[serde(default = "default_true")] pub remote_control: bool,
+}
+
+fn default_true() -> bool { true }
+
+/// Settings for the external control bus (see `control.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlConfig {
+    /// Master switch. When false no control directory is created and the CLI
+    /// mode reports the instance as unreachable.
+    #[serde(default = "default_true")] pub enabled: bool,
+    /// Directory the app watches for `.cmd` files. Empty = `<config>.ctl` next
+    /// to the config file. Relative paths resolve against the config's directory.
+    #[serde(default)] pub dir: String,
+    /// Actions clients may issue. Empty = all of start, stop, restart, status.
+    #[serde(default)] pub allowed_actions: Vec<String>,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self { Self { enabled: true, dir: String::new(), allowed_actions: vec![] } }
+}
+
+impl ControlConfig {
+    pub(crate) fn action_allowed(&self, action: &str) -> bool {
+        self.allowed_actions.is_empty()
+            || self.allowed_actions.iter().any(|a| a.eq_ignore_ascii_case(action))
+    }
 }
 
 impl Component {
@@ -42,6 +71,7 @@ impl Component {
             log_path:     String::new(),
             run_as_user:  String::new(),
             env_vars:     vec![],
+            remote_control: true,
         }
     }
 }
@@ -55,7 +85,8 @@ pub struct Group {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
-    #[serde(default)] pub groups: Vec<Group>,
+    #[serde(default)] pub groups:  Vec<Group>,
+    #[serde(default)] pub control: ControlConfig,
 }
 
 /// Load the config. A missing file is normal (fresh start); an unreadable or

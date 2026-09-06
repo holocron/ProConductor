@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod control;
 mod highlight;
 mod platform;
 mod process;
@@ -15,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use app::{PidRegistry, ProConductor};
+use app::{AppHandle, PidRegistry, ProConductor};
 use config::{load_config, sanitize_config};
 use process::{force_kill_tree, graceful_kill_tree};
 use theme::{AMBER, BG_BASE, TEXT_SEC};
@@ -53,22 +54,47 @@ impl eframe::App for AlreadyRunningApp {
 
 fn print_usage() {
     eprintln!("Usage: proconductor [config.json] [--autostart] [--minimized]");
+    eprintln!("       proconductor [config.json] --start|--stop|--restart <target> [--timeout SECS]");
+    eprintln!("       proconductor [config.json] --status");
     eprintln!();
     eprintln!("  config.json   Path to config file (default: proconductor.json)");
     eprintln!("  --autostart   Start all components immediately on launch");
     eprintln!("  --minimized   Start with window minimized");
+    eprintln!();
+    eprintln!("Remote control of an already running instance (same config file):");
+    eprintln!("  --start <t>   Start a component/group        --status  Print JSON state");
+    eprintln!("  --stop <t>    Stop and wait until it is down  --timeout Wait limit (default 30s)");
+    eprintln!("  --restart <t> Stop, wait, start again");
+    eprintln!("  <t> = component name or id, group name or id, or `all`");
+    eprintln!("  Exit code 0 on success, 1 on failure/timeout. Output is the instance's reply.");
 }
 
 fn main() -> eframe::Result<()> {
     let mut config_path: Option<PathBuf> = None;
     let mut autostart  = false;
     let mut minimized  = false;
+    let mut remote: Option<(control::Action, String)> = None;
+    let mut timeout_secs: u64 = 30;
 
-    for arg in std::env::args().skip(1) {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--autostart"              => autostart = true,
             "--minimized"              => minimized  = true,
             "--help" | "-h"            => { print_usage(); std::process::exit(0); }
+            "--status"                 => remote = Some((control::Action::Status, String::new())),
+            "--start" | "--stop" | "--restart" => {
+                let Some(target) = args.next() else {
+                    eprintln!("{} requires a target", arg); print_usage(); std::process::exit(1);
+                };
+                let action = control::Action::parse(&arg[2..]).expect("known action");
+                remote = Some((action, target));
+            }
+            "--timeout" => {
+                timeout_secs = args.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("--timeout requires a number of seconds"); std::process::exit(1);
+                });
+            }
             a if a.starts_with('-')    => { eprintln!("Unknown argument: {}", a); print_usage(); std::process::exit(1); }
             _                          => config_path = Some(PathBuf::from(&arg)),
         }
@@ -76,6 +102,16 @@ fn main() -> eframe::Result<()> {
     let config_path = config_path.unwrap_or_else(|| PathBuf::from("proconductor.json"));
 
     let (mut config, load_error) = load_config(&config_path);
+
+    // ── CLI client mode: talk to the running instance and exit ──────────────
+    if let Some((action, target)) = remote {
+        if let Some(e) = &load_error { eprintln!("ProConductor: {}", e); std::process::exit(1); }
+        match control::send_command(&config, &config_path, action, &target, Duration::from_secs(timeout_secs)) {
+            Ok((true,  msg)) => { println!("{}", msg); std::process::exit(0); }
+            Ok((false, msg)) => { eprintln!("{}", msg); std::process::exit(1); }
+            Err(e)           => { eprintln!("ProConductor: {}", e); std::process::exit(1); }
+        }
+    }
     // Repair missing/duplicate ids from hand-edited configs; mark dirty so the
     // repair can be persisted by the user.
     let ids_repaired = sanitize_config(&mut config);
@@ -159,6 +195,6 @@ Close that window first.", name);
     eframe::run_native(
         &title,
         options,
-        Box::new(move |cc| Box::new(ProConductor::new(cc, config, config_path, lock_file, pid_registry, autostart, minimized, load_error, ids_repaired))),
+        Box::new(move |cc| Box::new(AppHandle::new(ProConductor::new(cc, config, config_path, lock_file, pid_registry, autostart, minimized, load_error, ids_repaired)))),
     )
 }

@@ -150,6 +150,11 @@ impl ProConductor {
                         ui.label(RichText::new("Unix: sudo -u").size(9.0).color(TEXT_DIM));
                         ui.add(egui::TextEdit::singleline(&mut c.run_as_user).hint_text("e.g. www-data").desired_width(200.0));
                     });
+                    field_row(ui, "Remote Control", |ui| {
+                        ui.checkbox(&mut c.remote_control, "");
+                        ui.label(RichText::new("allow start/stop/restart via CLI & command files")
+                            .size(9.0).color(TEXT_DIM));
+                    });
 
                     ui.add_space(14.0);
                     section_title(ui, "ENVIRONMENT VARIABLES");
