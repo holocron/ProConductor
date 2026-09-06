@@ -90,6 +90,65 @@ Targets are matched by component name or id, group name or id, or `all`
 timeout (default 30 s); the instance's reply is printed to stdout/stderr, so
 an agent can simply shell out and check the exit code.
 
+### Example: letting a coding agent restart your MCP server
+
+Say `production.json` has a component named `MCP Server` that runs an MCP
+server the agent itself is developing. Give the agent one instruction in its
+project notes (e.g. `CLAUDE.md`, `AGENTS.md`, `.cursorrules`):
+
+```markdown
+## Restarting the MCP server
+The MCP server runs under ProConductor. After changing its code, rebuild and
+restart it with:
+
+    /opt/proconductor/proconductor /opt/myapp/production.json --restart "MCP Server"
+
+Exit code 0 means the new process is up. Check state with `--status`.
+```
+
+A typical agent loop then looks like this:
+
+```bash
+cargo build --release \
+  && /opt/proconductor/proconductor /opt/myapp/production.json --restart "MCP Server" \
+  && /opt/proconductor/proconductor /opt/myapp/production.json --status \
+       | python3 -c 'import json,sys; c=[c for g in json.load(sys.stdin)["groups"] for c in g["components"] if c["name"]=="MCP Server"][0]; print(c["state"], c["pid"])'
+# → running 48213
+```
+
+Or as a Claude Code hook that restarts after every edit under `mcp/`, in
+`.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "case \"$CLAUDE_FILE_PATH\" in */mcp/*) /opt/proconductor/proconductor /opt/myapp/production.json --restart \"MCP Server\";; esac"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Nothing in the agent needs to know about ports or PIDs: the CLI finds the
+running instance through the config path, and the call blocks until the
+restarted process is actually up (or fails, exit code 1 with the reason).
+
+If you'd rather not let agents stop other services, restrict the config:
+
+```json
+"control": { "enabled": true, "allowed_actions": ["restart", "status"] }
+```
+
+and set `"remote_control": false` on every component the agent must not touch.
+
 ### Under the hood — control port
 
 The CLI is a thin client over a loopback TCP socket, so anything that can open
