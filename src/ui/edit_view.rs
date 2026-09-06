@@ -152,7 +152,7 @@ impl ProConductor {
                     });
                     field_row(ui, "Remote Control", |ui| {
                         ui.checkbox(&mut c.remote_control, "");
-                        ui.label(RichText::new("allow start/stop/restart via CLI & command files")
+                        ui.label(RichText::new("allow start/stop/restart via CLI / control port")
                             .size(9.0).color(TEXT_DIM));
                     });
 

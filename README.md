@@ -20,6 +20,10 @@ Built with **Rust + egui** — no runtime, no WebView, no installer needed.
 The config file is created automatically if it doesn't exist.
 Each invocation is a fully independent instance.
 
+Launching from a terminal returns the prompt immediately: the GUI detaches into
+its own background session. Pass `--foreground` to keep it attached (useful
+under systemd or when debugging).
+
 ---
 
 ## Config file format
@@ -52,7 +56,7 @@ The config is plain JSON, human-readable and version-control friendly:
   ],
   "control": {
     "enabled": true,
-    "dir": "",
+    "port": 0,
     "allowed_actions": []
   }
 }
@@ -86,20 +90,23 @@ Targets are matched by component name or id, group name or id, or `all`
 timeout (default 30 s); the instance's reply is printed to stdout/stderr, so
 an agent can simply shell out and check the exit code.
 
-### Under the hood — command files
+### Under the hood — control port
 
-The CLI is a thin client over a file-based bus, so anything that can write a
-file can control ProConductor (cron, systemd hooks, CI, Task Scheduler, another
-language). Next to `production.json` the app watches `production.json.ctl/`:
+The CLI is a thin client over a loopback TCP socket, so anything that can open
+a socket can control ProConductor (cron, systemd hooks, CI, Task Scheduler,
+any language) — event-driven, no polling, identical on Windows, macOS and
+Linux. The instance listens on `127.0.0.1` and publishes the port in
+`production.json.port` next to the config:
 
-1. Write a file with a `.tmp` suffix, then rename it to `<anything>.cmd`
-   (the rename makes the write atomic). Content is either one line
-   `restart MCP Server` or JSON `{"action":"restart","target":"MCP Server"}`.
-2. The app consumes the `.cmd` and writes `<anything>.result` containing
-   `{"ok": true|false, "message": "..."}`. For `stop`/`restart` the result
-   appears only once the process is really down / really running again.
-3. Stale results are swept after 10 minutes; commands left over from a
-   previous run are discarded on startup, never replayed.
+```bash
+printf 'restart MCP Server\n' | nc 127.0.0.1 $(cat production.json.port)
+# → {"ok":true,"message":"done"}
+```
+
+Protocol: one request line, one reply line. The request is either plain text
+`restart MCP Server` or JSON `{"action":"restart","target":"MCP Server"}`;
+the reply is `{"ok": true|false, "message": "..."}`. For `stop`/`restart` the
+reply arrives only once the process is really down / really running again.
 
 This works while the window is minimized or hidden in the tray.
 
@@ -109,16 +116,16 @@ Top-level `"control"` block in the config file:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` | Master switch. `false` = no control directory, CLI reports the instance as unreachable. |
-| `dir` | `""` | Watched directory. Empty = `<config>.ctl` next to the config; relative paths resolve against the config's folder. |
+| `enabled` | `true` | Master switch. `false` = nothing listens, CLI reports the instance as unreachable. |
+| `port` | `0` | Loopback TCP port. `0` = OS-assigned; the actual port is always written to `<config>.port`. Set a fixed port if clients should not have to read the file. |
 | `allowed_actions` | `[]` (all) | Subset of `start`, `stop`, `restart`, `status` that clients may issue. |
 
 Per component, `"remote_control": false` (also a checkbox in the Configure
 view) excludes it from remote start/stop/restart — a group- or `all`-wide
 command silently skips it, a direct command is refused.
 
-Anyone with write access to the control directory can start and stop your
-processes; keep its permissions in line with the config file's.
+The socket is bound to loopback only, so any local user can talk to it —
+the same trust boundary as the config file and the processes themselves.
 
 ---
 

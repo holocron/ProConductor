@@ -49,7 +49,7 @@ pub(crate) struct RunningProcess {
 /// A control-bus reply that can only be written once every targeted
 /// component has finished stopping (and, for restart, started again).
 pub(crate) struct PendingReply {
-    pub(crate) path:      PathBuf,
+    pub(crate) reply:     control::Replier,
     pub(crate) remaining: usize,
     pub(crate) errors:    Vec<String>,
 }
@@ -235,13 +235,25 @@ impl ProConductor {
         self.reload_control();
     }
 
-    /// (Re)create the control bus to match the current config.
+    /// (Re)create the control listener to match the current config.
     fn reload_control(&mut self) {
-        let want = control::control_dir_for(&self.config, &self.config_path);
-        let have = self.control.as_ref().map(|b| b.dir().to_path_buf());
-        if want == have && self.control.is_some() == want.is_some() { return; }
-        self.control = None; // stop the old watcher before starting a new one
-        self.control = want.map(|d| ControlBus::new(d, self.self_weak.clone(), self.ctx_handle.clone()));
+        let want: Option<u16> = self.config.control.enabled.then_some(self.config.control.port);
+        let have = self.control.as_ref().map(|b| b.port());
+        // Port 0 means "any": an existing listener satisfies it.
+        let satisfied = match (want, have) {
+            (None, None) => true,
+            (Some(0), Some(_)) => true,
+            (Some(w), Some(h)) => w == h,
+            _ => false,
+        };
+        if satisfied { return; }
+        self.control = None; // release the old port before binding a new one
+        if let Some(port) = want {
+            match ControlBus::new(port, &self.config_path, self.self_weak.clone(), self.ctx_handle.clone()) {
+                Ok(bus) => self.control = Some(bus),
+                Err(e)  => self.save_error = Some(e),
+            }
+        }
     }
 
     // ── Process spawning ───────────────────────────────────────────────────
@@ -540,8 +552,8 @@ impl ProConductor {
                 for v in self.reply_waiters.values_mut() {
                     for idx in v.iter_mut() { if *idx > i { *idx -= 1; } }
                 }
-                if r.errors.is_empty() { control::write_result(&r.path, true, "done"); }
-                else { control::write_result(&r.path, false, &r.errors.join("; ")); }
+                if r.errors.is_empty() { r.reply.send(true, "done"); }
+                else { r.reply.send(false, &r.errors.join("; ")); }
             } else { i += 1; }
         }
     }
@@ -591,17 +603,18 @@ impl ProConductor {
 
     pub(crate) fn handle_control_command(&mut self, cmd: ControlCommand) {
         if !self.config.control.action_allowed(cmd.action.as_str()) {
-            control::write_result(&cmd.path, false,
+            cmd.reply.send(false,
                 &format!("Action '{}' is not allowed by this config (control.allowed_actions).", cmd.action.as_str()));
             return;
         }
         if cmd.action == Action::Status {
-            control::write_result(&cmd.path, true, &self.status_json());
+            let s = self.status_json();
+            cmd.reply.send(true, &s);
             return;
         }
         let comps = match self.resolve_targets(&cmd.target) {
             Ok(c) => c,
-            Err(e) => { control::write_result(&cmd.path, false, &e); return; }
+            Err(e) => { cmd.reply.send(false, &e); return; }
         };
         let names: Vec<&str> = comps.iter().map(|c| c.name.as_str()).collect();
         self.logs.entry(comps[0].id.clone()).or_default().push(LogLine {
@@ -620,8 +633,8 @@ impl ProConductor {
                     self.start(c);
                     if !self.running.contains_key(&c.id) { errors.push(format!("{}: failed to start", c.name)); }
                 }
-                if errors.is_empty() { control::write_result(&cmd.path, true, "done"); }
-                else { control::write_result(&cmd.path, false, &errors.join("; ")); }
+                if errors.is_empty() { cmd.reply.send(true, "done"); }
+                else { cmd.reply.send(false, &errors.join("; ")); }
             }
             Action::Stop | Action::Restart => {
                 // Anything that must go down first is awaited; the rest is
@@ -639,11 +652,11 @@ impl ProConductor {
                     }
                 }
                 if waiting.is_empty() {
-                    if errors.is_empty() { control::write_result(&cmd.path, true, "done"); }
-                    else { control::write_result(&cmd.path, false, &errors.join("; ")); }
+                    if errors.is_empty() { cmd.reply.send(true, "done"); }
+                    else { cmd.reply.send(false, &errors.join("; ")); }
                 } else {
                     let idx = self.replies.len();
-                    self.replies.push(PendingReply { path: cmd.path, remaining: waiting.len(), errors });
+                    self.replies.push(PendingReply { reply: cmd.reply, remaining: waiting.len(), errors });
                     for id in waiting { self.reply_waiters.entry(id).or_default().push(idx); }
                 }
             }
@@ -731,6 +744,14 @@ impl AppHandle {
     pub(crate) fn new(app: ProConductor) -> Self {
         let arc = Arc::new(Mutex::new(app));
         lock_app(&arc).attach(Arc::downgrade(&arc));
+        // Housekeeping: process exits and deferred control replies must be
+        // handled even when no frames arrive (minimized window on macOS).
+        let weak = Arc::downgrade(&arc);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(250));
+            let Some(app) = weak.upgrade() else { break };
+            lock_app(&app).drain_events();
+        });
         Self(arc)
     }
 }

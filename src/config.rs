@@ -39,18 +39,18 @@ fn default_true() -> bool { true }
 /// Settings for the external control bus (see `control.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlConfig {
-    /// Master switch. When false no control directory is created and the CLI
-    /// mode reports the instance as unreachable.
+    /// Master switch. When false nothing listens and the CLI mode reports the
+    /// instance as unreachable.
     #[serde(default = "default_true")] pub enabled: bool,
-    /// Directory the app watches for `.cmd` files. Empty = `<config>.ctl` next
-    /// to the config file. Relative paths resolve against the config's directory.
-    #[serde(default)] pub dir: String,
+    /// Loopback TCP port to listen on. 0 = let the OS pick; the actual port is
+    /// always published in `<config>.port` next to the config file.
+    #[serde(default)] pub port: u16,
     /// Actions clients may issue. Empty = all of start, stop, restart, status.
     #[serde(default)] pub allowed_actions: Vec<String>,
 }
 
 impl Default for ControlConfig {
-    fn default() -> Self { Self { enabled: true, dir: String::new(), allowed_actions: vec![] } }
+    fn default() -> Self { Self { enabled: true, port: 0, allowed_actions: vec![] } }
 }
 
 impl ControlConfig {

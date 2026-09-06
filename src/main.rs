@@ -12,6 +12,7 @@ mod ui;
 use eframe::egui::{self, RichText};
 use fs2::FileExt;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -60,6 +61,7 @@ fn print_usage() {
     eprintln!("  config.json   Path to config file (default: proconductor.json)");
     eprintln!("  --autostart   Start all components immediately on launch");
     eprintln!("  --minimized   Start with window minimized");
+    eprintln!("  --foreground  Stay attached to the console (default: detach and return the prompt)");
     eprintln!();
     eprintln!("Remote control of an already running instance (same config file):");
     eprintln!("  --start <t>   Start a component/group        --status  Print JSON state");
@@ -69,10 +71,36 @@ fn print_usage() {
     eprintln!("  Exit code 0 on success, 1 on failure/timeout. Output is the instance's reply.");
 }
 
+#[cfg(windows)]
+extern "system" { fn AttachConsole(pid: u32) -> i32; }
+
+/// Re-exec this binary with the same arguments plus `--foreground`, fully
+/// detached: no stdio, own session (Unix: setsid, so closing the terminal
+/// does not SIGHUP the GUI; Windows: no console attached).
+fn spawn_detached() -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.args(std::env::args_os().skip(1)).arg("--foreground")
+       .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(unix)] {
+        use std::os::unix::process::CommandExt;
+        extern "C" { fn setsid() -> i32; }
+        // SAFETY: setsid is async-signal-safe and takes no arguments.
+        unsafe { cmd.pre_exec(|| { setsid(); Ok(()) }); }
+    }
+    #[cfg(windows)] {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(DETACHED_PROCESS);
+    }
+    cmd.spawn().map(|_| ())
+}
+
 fn main() -> eframe::Result<()> {
     let mut config_path: Option<PathBuf> = None;
     let mut autostart  = false;
     let mut minimized  = false;
+    let mut foreground = false;
     let mut remote: Option<(control::Action, String)> = None;
     let mut timeout_secs: u64 = 30;
 
@@ -81,6 +109,7 @@ fn main() -> eframe::Result<()> {
         match arg.as_str() {
             "--autostart"              => autostart = true,
             "--minimized"              => minimized  = true,
+            "--foreground"             => foreground = true,
             "--help" | "-h"            => { print_usage(); std::process::exit(0); }
             "--status"                 => remote = Some((control::Action::Status, String::new())),
             "--start" | "--stop" | "--restart" => {
@@ -105,6 +134,12 @@ fn main() -> eframe::Result<()> {
 
     // ── CLI client mode: talk to the running instance and exit ──────────────
     if let Some((action, target)) = remote {
+        // Release builds are a GUI-subsystem executable on Windows and start
+        // without a console; borrow the parent's so the reply is visible.
+        // (No children are spawned in this mode, so the stdio-handle caveat in
+        // process.rs does not apply here.)
+        #[cfg(windows)]
+        unsafe { AttachConsole(u32::MAX); }
         if let Some(e) = &load_error { eprintln!("ProConductor: {}", e); std::process::exit(1); }
         match control::send_command(&config, &config_path, action, &target, Duration::from_secs(timeout_secs)) {
             Ok((true,  msg)) => { println!("{}", msg); std::process::exit(0); }
@@ -112,6 +147,16 @@ fn main() -> eframe::Result<()> {
             Err(e)           => { eprintln!("ProConductor: {}", e); std::process::exit(1); }
         }
     }
+    // ── Detach from the launching console ───────────────────────────────────
+    // Relaunch ourselves as a background session and return the prompt at once;
+    // `--foreground` keeps the classic attached behaviour (debugging, systemd).
+    if !foreground {
+        match spawn_detached() {
+            Ok(())  => std::process::exit(0),
+            Err(e)  => eprintln!("ProConductor: could not detach from console ({}); running in foreground.", e),
+        }
+    }
+
     // Repair missing/duplicate ids from hand-edited configs; mark dirty so the
     // repair can be persisted by the user.
     let ids_repaired = sanitize_config(&mut config);
@@ -180,6 +225,7 @@ Close that window first.", name);
     // Shared PID registry — signal handler kills all children on Ctrl+C / SIGTERM
     let pid_registry: PidRegistry = Arc::new(Mutex::new(Vec::new()));
     let registry_for_signal = pid_registry.clone();
+    let port_file_for_signal = control::port_file_for(&config_path);
 
     ctrlc::set_handler(move || {
         // Kill every registered child tree: graceful signal to all, a short
@@ -189,6 +235,8 @@ Close that window first.", name);
         for &pid in &pids { graceful_kill_tree(pid); }
         thread::sleep(Duration::from_millis(500));
         for &pid in &pids { force_kill_tree(pid); }
+        // process::exit skips destructors — drop the advertised port by hand.
+        let _ = std::fs::remove_file(&port_file_for_signal);
         std::process::exit(0);
     }).expect("Failed to set signal handler");
 

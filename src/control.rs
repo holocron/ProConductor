@@ -1,16 +1,16 @@
-//! External control bus: lets scripts, agents and other processes start, stop,
+//! External control: lets scripts, agents and other processes start, stop,
 //! restart and query components of a running ProConductor instance.
 //!
-//! Mechanism (dependency-free, works on Linux/macOS/Windows):
-//!   * Next to `foo.json` the app owns a directory `foo.json.ctl/`.
-//!   * A client drops `<anything>.cmd` into it (write to `.tmp`, then rename so
-//!     the app never reads a half-written file). Content is either JSON
-//!     `{"action":"restart","target":"MCP Server"}` or one plain-text line
-//!     `restart MCP Server`.
-//!   * The app watches the directory, executes the command, deletes the `.cmd`
-//!     and writes `<anything>.result` containing `{"ok":bool,"message":...}`.
-//!     For `stop`/`restart` the result is written only when the process is
-//!     really down / really back up, so a client can block on it.
+//! Mechanism (dependency-free, event-driven, identical on Linux/macOS/Windows):
+//!   * The instance listens on a loopback TCP socket (127.0.0.1, port from
+//!     `control.port`, 0 = OS-assigned). The bound port is published in
+//!     `<config>.port` next to the config file so clients find it.
+//!   * Protocol: one request line, one reply line. Request is either JSON
+//!     `{"action":"restart","target":"MCP Server"}` or plain text
+//!     `restart MCP Server`. Reply is `{"ok":bool,"message":...}`.
+//!     `printf 'restart MCP Server\n' | nc 127.0.0.1 $(cat app.json.port)` works.
+//!   * For `stop`/`restart` the reply is sent only when the process is really
+//!     down / really back up, so a client can block on it.
 //!   * `proconductor foo.json --restart "MCP Server"` does exactly that from
 //!     the CLI and exits 0/1 — the intended entry point for automation.
 //!
@@ -18,15 +18,16 @@
 //! id, group name, or `all`.
 
 use eframe::egui;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::app::{lock_app, ProConductor};
 use crate::config::AppConfig;
-use crate::process::resolve_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action { Start, Stop, Restart, Status }
@@ -49,26 +50,34 @@ impl Action {
     }
 }
 
-#[derive(Debug, Clone)]
+/// One connected client waiting for its reply line.
+pub struct Replier(Option<TcpStream>);
+
+impl Replier {
+    /// Send `{ok, message}` and close. Best-effort: a client that already hung
+    /// up simply doesn't get it.
+    pub fn send(mut self, ok: bool, message: &str) {
+        if let Some(mut s) = self.0.take() {
+            let out = serde_json::json!({ "ok": ok, "message": message }).to_string();
+            let _ = s.write_all(out.as_bytes());
+            let _ = s.write_all(b"\n");
+            let _ = s.flush();
+        }
+    }
+}
+
 pub struct ControlCommand {
-    /// Path of the `.cmd` file; the `.result` is written next to it.
-    pub path:   PathBuf,
+    pub reply:  Replier,
     pub action: Action,
     pub target: String,
 }
 
-/// Control directory for a config: `control.dir` if set (relative to the
-/// config's folder), otherwise `foo.json` → `foo.json.ctl`. None if disabled.
-pub fn control_dir_for(config: &AppConfig, config_path: &Path) -> Option<PathBuf> {
-    if !config.control.enabled { return None; }
-    if !config.control.dir.trim().is_empty() {
-        let base = config_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-        return Some(resolve_path(config.control.dir.trim(), &base));
-    }
+/// `foo.json` → `foo.json.port` — where the bound port is published.
+pub fn port_file_for(config_path: &Path) -> PathBuf {
     let mut p = config_path.to_path_buf();
-    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string() + ".ctl";
+    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string() + ".port";
     p.set_file_name(name);
-    Some(p)
+    p
 }
 
 fn parse_body(body: &str) -> Option<(Action, String)> {
@@ -86,108 +95,84 @@ fn parse_body(body: &str) -> Option<(Action, String)> {
     Some((action, target))
 }
 
-/// Write `{ok, message}` next to the command file. Best-effort: a client that
-/// already gave up (or never waited) simply leaves a file we sweep later.
-pub fn write_result(cmd_path: &Path, ok: bool, message: &str) {
-    let out = serde_json::json!({ "ok": ok, "message": message }).to_string();
-    let result = cmd_path.with_extension("result");
-    let tmp    = cmd_path.with_extension("result.tmp");
-    if std::fs::write(&tmp, out).is_ok() {
-        let _ = std::fs::rename(&tmp, &result);
-    }
-}
-
 // ══════════════════════════════════════════════════════════════════════════════
-// App side — watcher thread
+// App side — listener thread
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Watches the control directory on its own thread and executes commands
-/// directly against the shared app state. A minimized/occluded window gets no
+/// Accepts control connections on its own thread and executes commands
+/// directly against the shared app state — a minimized/occluded window gets no
 /// frames on macOS, so anything routed through the frame loop would stall
-/// exactly when automation needs it most. The same tick also drains process
-/// events, so exits and deferred replies are handled while minimized too.
+/// exactly when automation needs it most.
 pub struct ControlBus {
-    dir:  PathBuf,
-    stop: Arc<AtomicBool>,
+    port:      u16,
+    port_file: PathBuf,
+    stop:      Arc<AtomicBool>,
 }
 
-const POLL_INTERVAL:  Duration = Duration::from_millis(300);
-const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-/// Result files nobody collected are deleted after this long.
-const RESULT_TTL:     Duration = Duration::from_secs(600);
+/// A client gets this long to send its request line.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl ControlBus {
-    /// Creates the directory, clears commands left over from a previous run
-    /// (executing yesterday's stale "stop" on a fresh instance would be a nasty
-    /// surprise) and starts the watcher thread.
-    pub fn new(dir: PathBuf, app: Weak<Mutex<ProConductor>>, ctx: egui::Context) -> Self {
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if matches!(ext, "cmd" | "result" | "tmp") { let _ = std::fs::remove_file(&p); }
-            }
-        }
+    pub fn new(want_port: u16, config_path: &Path, app: Weak<Mutex<ProConductor>>, ctx: egui::Context) -> Result<Self, String> {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, want_port)))
+            .map_err(|e| format!("Remote control: cannot listen on 127.0.0.1:{}: {}", want_port, e))?;
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(want_port);
+        let port_file = port_file_for(config_path);
+        std::fs::write(&port_file, port.to_string())
+            .map_err(|e| format!("Remote control: cannot write {}: {}", port_file.display(), e))?;
+
         let stop = Arc::new(AtomicBool::new(false));
-        let (d, s) = (dir.clone(), stop.clone());
+        let s = stop.clone();
         thread::spawn(move || {
-            let mut last_sweep = Instant::now();
-            while !s.load(Ordering::Relaxed) {
-                thread::sleep(POLL_INTERVAL);
-                if last_sweep.elapsed() >= SWEEP_INTERVAL { last_sweep = Instant::now(); sweep(&d); }
-                let cmds = collect(&d);           // filesystem work outside the lock
-                let Some(app) = app.upgrade() else { return };
-                let mut a = lock_app(&app);
-                a.drain_events();
-                if cmds.is_empty() { continue; }
-                for c in cmds { a.handle_control_command(c); }
-                drop(a);
-                ctx.request_repaint();
+            for stream in listener.incoming() {
+                if s.load(Ordering::Relaxed) { break; }
+                let Ok(stream) = stream else { continue };
+                let Some(app) = app.upgrade() else { break };
+                let ctx = ctx.clone();
+                // One thread per connection so a slow client can't block others.
+                thread::spawn(move || {
+                    let Some(cmd) = read_request(stream) else { return };
+                    let mut a = lock_app(&app);
+                    a.drain_events();
+                    a.handle_control_command(cmd);
+                    drop(a);
+                    ctx.request_repaint();
+                });
             }
         });
-        Self { dir, stop }
+        Ok(Self { port, port_file, stop })
     }
 
-    pub fn dir(&self) -> &Path { &self.dir }
+    pub fn port(&self) -> u16 { self.port }
 }
 
 impl Drop for ControlBus {
-    fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); }
-}
-
-/// Newly arrived commands, oldest first. Unparseable files get an immediate
-/// error result. Files are removed before they are handed out, so a crash
-/// mid-execution can never replay a command on the next tick.
-fn collect(dir: &Path) -> Vec<ControlCommand> {
-    let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
-    let mut files: Vec<(SystemTime, PathBuf)> = rd.flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("cmd"))
-        .map(|p| (p.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH), p))
-        .collect();
-    files.sort();
-    let mut out = vec![];
-    for (_, path) in files {
-        let body = std::fs::read_to_string(&path).unwrap_or_default();
-        let _ = std::fs::remove_file(&path);
-        match parse_body(&body) {
-            Some((action, target)) => out.push(ControlCommand { path, action, target }),
-            None => write_result(&path, false,
-                "Unrecognised command. Use `start|stop|restart <target>` or `status`."),
-        }
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Unblock accept() so the thread notices the flag.
+        let _ = TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)), Duration::from_millis(200));
+        let _ = std::fs::remove_file(&self.port_file);
     }
-    out
 }
 
-fn sweep(dir: &Path) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for p in rd.flatten().map(|e| e.path()) {
-        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !matches!(ext, "result" | "tmp") { continue; }
-        let age = p.metadata().and_then(|m| m.modified()).ok()
-            .and_then(|m| SystemTime::now().duration_since(m).ok());
-        if age.is_none_or(|a| a > RESULT_TTL) { let _ = std::fs::remove_file(&p); }
+fn read_request(stream: TcpStream) -> Option<ControlCommand> {
+    let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
+    let mut line = String::new();
+    {
+        let mut r = BufReader::new(&stream);
+        // Cap the request so a misbehaving client can't make us buffer forever.
+        if r.by_ref().take(64 * 1024).read_line(&mut line).is_err() { return None; }
+    }
+    if line.trim().is_empty() { return None; } // our own wake-up connect, or noise
+    match parse_body(&line) {
+        Some((action, target)) => Some(ControlCommand { reply: Replier(Some(stream)), action, target }),
+        None => {
+            Replier(Some(stream)).send(false,
+                "Unrecognised command. Use `start|stop|restart <target>` or `status`.");
+            None
+        }
     }
 }
 
@@ -196,44 +181,37 @@ fn sweep(dir: &Path) {
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// Send one command to the instance owning `config_path` and wait for its
-/// result. Returns Ok((ok, message)); Err if there is no instance / timeout.
+/// reply. Returns Ok((ok, message)); Err if there is no instance / timeout.
 pub fn send_command(config: &AppConfig, config_path: &Path, action: Action, target: &str, timeout: Duration) -> Result<(bool, String), String> {
-    let Some(dir) = control_dir_for(config, config_path) else {
+    if !config.control.enabled {
         return Err(format!("Remote control is disabled in {} (\"control\": {{\"enabled\": false}}).", config_path.display()));
-    };
-    if !dir.is_dir() {
-        return Err(format!(
-            "No running ProConductor instance for {} (control dir {} missing).",
-            config_path.display(), dir.display()));
     }
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-    let base  = dir.join(format!("{}-{}", stamp, std::process::id()));
-    let tmp   = base.with_extension("tmp");
-    let cmd   = base.with_extension("cmd");
-    let res   = base.with_extension("result");
-    let body  = serde_json::json!({ "action": action.as_str(), "target": target }).to_string();
-    std::fs::write(&tmp, body).map_err(|e| format!("Cannot write command: {}", e))?;
-    std::fs::rename(&tmp, &cmd).map_err(|e| format!("Cannot write command: {}", e))?;
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(s) = std::fs::read_to_string(&res) {
-            let _ = std::fs::remove_file(&res);
-            let v: serde_json::Value = serde_json::from_str(&s).unwrap_or_default();
-            let ok  = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
-            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
-            return Ok((ok, msg));
-        }
-        if Instant::now() >= deadline {
-            // Withdraw the command if nobody picked it up — otherwise a later
-            // instance would execute it out of the blue.
-            let _ = std::fs::remove_file(&cmd);
-            return Err(format!(
-                "Timed out after {}s waiting for ProConductor ({}) — is it running?",
-                timeout.as_secs(), config_path.display()));
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    let port_file = port_file_for(config_path);
+    let port: u16 = std::fs::read_to_string(&port_file).ok()
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(|| format!(
+            "No running ProConductor instance for {} ({} not found).",
+            config_path.display(), port_file.display()))?;
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map_err(|e| format!("No running ProConductor instance for {} (port {}: {}).", config_path.display(), port, e))?;
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(timeout));
+    let body = serde_json::json!({ "action": action.as_str(), "target": target }).to_string();
+    stream.write_all(body.as_bytes()).and_then(|_| stream.write_all(b"\n"))
+        .map_err(|e| format!("Cannot send command: {}", e))?;
+    let mut line = String::new();
+    match BufReader::new(&stream).read_line(&mut line) {
+        Ok(0) => return Err("ProConductor closed the connection without a reply.".into()),
+        Ok(_) => {}
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+            return Err(format!("Timed out after {}s waiting for ProConductor ({}).", timeout.as_secs(), config_path.display())),
+        Err(e) => return Err(format!("Error reading reply: {}", e)),
     }
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+    let ok  = v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+    let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    Ok((ok, msg))
 }
 
 #[cfg(test)]
